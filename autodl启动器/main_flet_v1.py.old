@@ -1,0 +1,3486 @@
+import sys
+import logging
+import re
+import shlex
+import threading
+import webbrowser
+import time
+import json
+import os
+import select
+import socket
+import subprocess
+import base64
+import ctypes
+import warnings
+from typing import Dict, List, Optional, Tuple, Any
+import asyncio
+import flet as ft
+
+# 检查程序是否被打包成EXE
+def is_frozen():
+    return getattr(sys, 'frozen', False)
+
+def _pip_install(pkgs):
+    # 如果是打包后的EXE，直接返回False，绝对不能运行pip
+    if is_frozen():
+        print(f"打包环境下无法安装依赖: {pkgs}，请确保构建时已包含。")
+        return False
+    
+    try:
+        try:
+            msg = f"需要安装依赖包:\n{', '.join(pkgs)}\n是否继续?"
+            title = "安装依赖确认"
+            IDYES = 6
+            MB_YESNO = 4
+            MB_ICONQUESTION = 32
+            res = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNO | MB_ICONQUESTION)
+            if res != IDYES:
+                return False
+        except Exception:
+            pass
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', *pkgs])
+        return True
+    except Exception:
+        return False
+
+def _win_dpapi_encrypt(plaintext):
+    try:
+        if not isinstance(plaintext, (bytes, bytearray)):
+            plaintext = str(plaintext).encode('utf-8')
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.c_void_p)]
+        CryptProtectData = ctypes.windll.crypt32.CryptProtectData
+        CryptProtectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_wchar_p, ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(DATA_BLOB)]
+        CryptProtectData.restype = ctypes.c_bool
+        in_blob = DATA_BLOB(len(plaintext), ctypes.cast(ctypes.create_string_buffer(plaintext), ctypes.c_void_p))
+        out_blob = DATA_BLOB()
+        ok = CryptProtectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob))
+        if not ok:
+            return None
+        buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+        return "enc:" + base64.b64encode(buf).decode('ascii')
+    except Exception:
+        return None
+
+def _win_dpapi_decrypt(ciphertext):
+    try:
+        if not isinstance(ciphertext, str):
+            return None
+        if not ciphertext.startswith("enc:"):
+            return None
+        raw = base64.b64decode(ciphertext[4:])
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.c_void_p)]
+        CryptUnprotectData = ctypes.windll.crypt32.CryptUnprotectData
+        CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(DATA_BLOB)]
+        CryptUnprotectData.restype = ctypes.c_bool
+        in_blob = DATA_BLOB(len(raw), ctypes.cast(ctypes.create_string_buffer(raw), ctypes.c_void_p))
+        out_blob = DATA_BLOB()
+        desc = ctypes.c_wchar_p()
+        ok = CryptUnprotectData(ctypes.byref(in_blob), ctypes.byref(desc), None, None, None, 0, ctypes.byref(out_blob))
+        if not ok:
+            return None
+        buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+        try:
+            return buf.decode('utf-8')
+        except Exception:
+            return buf.decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+
+warnings.filterwarnings('ignore', message='.*TripleDES has been moved.*')
+try:
+    import paramiko
+except ImportError:
+    if not is_frozen() and _pip_install(['paramiko>=2.7.0']):
+        import paramiko
+    else:
+        if is_frozen():
+            raise ImportError("Critical: paramiko is missing in the frozen application.")
+        else:
+            raise
+
+# AutoDL相关导入
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.options import Options
+    from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException, ElementClickInterceptedException
+    from selenium.webdriver.common.action_chains import ActionChains
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
+
+class SSHPortForwarder:
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.page.title = "AutoDL 一键连接"
+        self.page.window.width = 1200
+        self.page.window.height = 900
+        self.page.window.min_width = 1000
+        self.page.window.min_height = 800
+        
+        # SSH相关属性
+        self.ssh_client = None
+        self.forward_thread = None
+        self.is_connected = False
+        self.stop_event = threading.Event()
+        self.client_threads = []
+        self.server_socket = None
+        self.is_connecting = False
+        self.reconnecting = False
+        self._last_connect_args = None
+        self.refreshing = False
+        self.port_forwarding_setup = False
+        try:
+            import threading as _th
+            self.autodl_refresh_lock = _th.Lock()
+        except Exception:
+            self.autodl_refresh_lock = None
+        self.autodl_busy = False
+        self.last_auto_refresh_time = 0
+        
+        # AutoDL相关
+        self.autodl_driver = None
+        self.is_autodl_logged_in = False
+        try:
+            base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.portable_base_dir = base_dir
+        self.config_dir = os.path.join(self.portable_base_dir, 'configs')
+        print(f"配置目录: {self.config_dir}")
+        self._init_config_directory()
+        self.current_theme = 'light'
+        self.await_running_device_id = None
+        self.await_running_remark = None
+        self.await_running_deadline = None
+        self.last_device_hash = None
+        self.encryption_enabled = False
+        self._load_encryption_pref()
+        self.encryption_prompted = False
+        self._load_encryption_prompted()
+        self.autodl_config_dir = self.config_dir
+        self.autodl_credentials_file = os.path.join(self.config_dir, 'autodl_credentials.json')
+        self._migrate_autodl_configs_to_unified()
+        self.device_map_file = os.path.join(self.config_dir, 'device_map.json')
+        self.readme_path = self._ensure_readme_file()
+        
+        # UI组件
+        self.ui_components = {}
+        self.setup_ui()
+        self.setup_event_handlers()
+        self.load_config_list()
+        self.load_autodl_credentials()
+        self.update_delete_button_state()
+        
+        # 初始化状态
+        self.update_status("程序初始化完成")
+        
+        # 启动刷新时间更新定时器
+        self.start_refresh_timer()
+        
+        # 尝试自动登录
+        if SELENIUM_AVAILABLE and self.auto_login_checkbox and self.auto_login_checkbox.value:
+            asyncio.create_task(self.autodl_login(None))
+
+    def _init_config_directory(self):
+        """初始化配置目录"""
+        try:
+            if not os.path.exists(self.config_dir):
+                os.makedirs(self.config_dir, exist_ok=True)
+                self.update_status(f'配置目录已创建: {self.config_dir}')
+        except PermissionError as e:
+            self.update_status(f'权限不足: 无法创建程序目录的配置文件 ({str(e)})，已回退到用户目录')
+            self.config_dir = os.path.join(os.path.expanduser('~'), '.ssh_port_forwarder', 'configs')
+            try:
+                os.makedirs(self.config_dir, exist_ok=True)
+                self.update_status(f'已使用用户目录: {self.config_dir}')
+            except Exception as e2:
+                self.update_status(f'严重警告: 无法创建用户目录配置: {str(e2)}')
+                self.config_dir = None
+        except Exception as e:
+            self.update_status(f'警告: 创建配置目录出错: {str(e)}，尝试使用用户目录')
+            self.config_dir = os.path.join(os.path.expanduser('~'), '.ssh_port_forwarder', 'configs')
+            try:
+                os.makedirs(self.config_dir, exist_ok=True)
+                self.update_status(f'已使用用户目录: {self.config_dir}')
+            except Exception as e2:
+                self.update_status(f'严重警告: 无法创建用户目录配置: {str(e2)}')
+                self.config_dir = None
+
+    def _migrate_autodl_configs_to_unified(self):
+        try:
+            old_dir = os.path.join(self.portable_base_dir, 'autodl_configs')
+            if os.path.isdir(old_dir):
+                # 迁移 credentials.json
+                try:
+                    name = 'credentials.json'
+                    src = os.path.join(old_dir, name)
+                    if os.path.exists(src):
+                        dst = os.path.join(self.config_dir, 'autodl_credentials.json')
+                        if not os.path.exists(dst):
+                            os.makedirs(self.config_dir, exist_ok=True)
+                            import shutil
+                            shutil.copyfile(src, dst)
+                            self.update_status('已迁移 credentials.json 到统一配置目录')
+                            print(f"DEBUG: 迁移旧配置 {src} -> {dst}")
+                        else:
+                            print(f"DEBUG: 跳过迁移，目标文件已存在: {dst}")
+                except Exception:
+                    pass
+                
+                # 迁移 cookies.json
+                try:
+                    name = 'cookies.json'
+                    src = os.path.join(old_dir, name)
+                    if os.path.exists(src):
+                        dst = os.path.join(self.config_dir, 'autodl_cookies.json')
+                        if not os.path.exists(dst):
+                            os.makedirs(self.config_dir, exist_ok=True)
+                            import shutil
+                            shutil.copyfile(src, dst)
+                            self.update_status('已迁移 cookies.json 到统一配置目录')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _get_readme_source_path(self):
+        try:
+            base = getattr(sys, '_MEIPASS', None)
+            if base:
+                p = os.path.join(base, 'README.md')
+                if os.path.exists(p):
+                    return p
+        except Exception:
+            pass
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'README.md')
+            if os.path.exists(p):
+                return p
+        except Exception:
+            pass
+        return None
+
+    def _ensure_readme_file(self):
+        try:
+            target = os.path.join(self.portable_base_dir, 'README.md')
+            if os.path.exists(target):
+                return target
+            
+            def copy_readme_async():
+                try:
+                    src = self._get_readme_source_path()
+                    if src and os.path.exists(src):
+                        import shutil
+                        try:
+                            shutil.copyfile(src, target)
+                        except Exception:
+                            pass
+                    if not os.path.exists(target):
+                        try:
+                            with open(target, 'w', encoding='utf-8') as f:
+                                f.write('AutoDL 一键连接使用说明\n\n- 在左侧填写 SSH 信息与端口后保存配置\n- 点击连接按钮建立端口转发\n- 问号按钮打开本说明文件\n')
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            
+            t = threading.Thread(target=copy_readme_async, daemon=True)
+            t.start()
+            
+            return target
+        except Exception:
+            return os.path.join(self.portable_base_dir, 'README.md')
+
+    def _encryption_pref_path(self):
+        try:
+            return os.path.join(self.config_dir or self.portable_base_dir, 'encryption_enabled.flag')
+        except Exception:
+            return os.path.join(self.portable_base_dir, 'encryption_enabled.flag')
+
+    def _load_encryption_pref(self):
+        try:
+            p = self._encryption_pref_path()
+            if os.path.exists(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    v = f.read().strip()
+                    self.encryption_enabled = (v == '1')
+        except Exception:
+            pass
+
+    def _set_encryption_pref(self, enabled):
+        try:
+            self.encryption_enabled = bool(enabled)
+            p = self._encryption_pref_path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('1' if self.encryption_enabled else '0')
+        except Exception:
+            pass
+
+    def _encryption_prompted_path(self):
+        try:
+            return os.path.join(self.config_dir or self.portable_base_dir, 'encryption_prompted.flag')
+        except Exception:
+            return os.path.join(self.portable_base_dir, 'encryption_prompted.flag')
+
+    def _load_encryption_prompted(self):
+        try:
+            p = self._encryption_prompted_path()
+            if os.path.exists(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    v = f.read().strip()
+                    self.encryption_prompted = (v == '1')
+        except Exception:
+            pass
+
+    def _set_encryption_prompted(self, prompted):
+        try:
+            self.encryption_prompted = bool(prompted)
+            p = self._encryption_prompted_path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('1' if self.encryption_prompted else '0')
+        except Exception:
+            pass
+
+    def setup_ui(self):
+        """设置Flet UI界面"""
+        # 应用主题
+        self.apply_theme()
+        
+        # 主容器
+        self.main_container = ft.Container(
+            expand=True,
+            padding=20,
+            bgcolor=self.theme_colors['background']
+        )
+        
+        # 主卡片
+        self.content_card = ft.Container(
+            expand=True,
+            border_radius=15,
+            border=ft.border.all(2, self.theme_colors['border']),
+            bgcolor=self.theme_colors['card_background'],
+            shadow=ft.BoxShadow(
+                spread_radius=1,
+                blur_radius=15,
+                color=ft.Colors.BLACK54,
+                offset=ft.Offset(0, 3)
+            )
+        )
+        
+        # 标题栏
+        self.title_bar = ft.Container(
+            height=60,
+            border_radius=ft.border_radius.only(top_left=15, top_right=15),
+            bgcolor=self.theme_colors['title_bar'],
+            border=ft.border.only(bottom=ft.border.BorderSide(1, self.theme_colors['border'])),
+            content=ft.Row([
+                ft.Text(
+                    "AutoDL 一键连接",
+                    size=24,
+                    weight=ft.FontWeight.BOLD,
+                    color=self.theme_colors['text']
+                ),
+                ft.Container(expand=True),
+                ft.IconButton(
+                    icon=ft.Icons.DARK_MODE if self.current_theme == 'light' else ft.Icons.LIGHT_MODE,
+                    on_click=self.toggle_theme,
+                    tooltip="切换主题"
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.HELP_OUTLINE,
+                    on_click=self.open_readme,
+                    tooltip="打开帮助文档"
+                )
+            ], alignment=ft.MainAxisAlignment.START)
+        )
+        
+        # 主体内容区域
+        self.body_content = ft.Container(
+            expand=True,
+            padding=20,
+            content=ft.Row([
+                # 左侧面板
+                self.create_left_panel(),
+                ft.VerticalDivider(width=2, color=self.theme_colors['divider']),
+                # 右侧面板
+                self.create_right_panel()
+            ], expand=True, spacing=20)
+        )
+        
+        # 组装主布局
+        self.content_card.content = ft.Column([
+            self.title_bar,
+            self.body_content
+        ], spacing=0)
+        
+        self.main_container.content = self.content_card
+        
+        # 设置页面
+        self.page.add(self.main_container)
+        self.page.update()
+
+    def create_left_panel(self):
+        """创建左侧面板（AutoDL控制）"""
+        # AutoDL登录区域
+        self.autodl_username_input = ft.TextField(
+            label="AutoDL用户名",
+            expand=True,
+            border_radius=8,
+            border_color=self.theme_colors['input_border'],
+            bgcolor=self.theme_colors['input_background'],
+            text_size=14
+        )
+        
+        self.autodl_password_input = ft.TextField(
+            label="密码",
+            password=True,
+            can_reveal_password=True,
+            expand=True,
+            border_radius=8,
+            border_color=self.theme_colors['input_border'],
+            bgcolor=self.theme_colors['input_background'],
+            text_size=14
+        )
+        
+        self.remember_password_checkbox = ft.Checkbox(
+            label="记住密码",
+            value=False
+        )
+        
+        self.show_password_checkbox = ft.Checkbox(
+            label="显示密码",
+            value=False
+        )
+        
+        self.auto_login_checkbox = ft.Checkbox(
+            label="启动时自动登录",
+            value=False
+        )
+        
+        self.silent_refresh_checkbox = ft.Checkbox(
+            label="静默自动刷新",
+            value=True
+        )
+        
+        self.visible_radio = ft.Radio(value="visible", label="可视浏览器")
+        self.headless_radio = ft.Radio(value="headless", label="静默模式")
+        
+        self.autodl_login_button = ft.ElevatedButton(
+            text="登录",
+            on_click=lambda e: self.autodl_login(None),
+            bgcolor=self.theme_colors['primary'],
+            color=ft.Colors.WHITE
+        )
+        
+        self.autodl_logout_button = ft.ElevatedButton(
+            text="登出",
+            on_click=self.autodl_logout,
+            bgcolor=self.theme_colors['error'],
+            color=ft.Colors.WHITE,
+            disabled=True
+        )
+        
+        self.autodl_status_label = ft.Text(
+            "未登录",
+            size=12,
+            color=self.theme_colors['secondary_text']
+        )
+        
+        # 设备表格
+        self.autodl_devices_table = ft.DataTable(
+            columns=[
+                ft.DataColumn(ft.Text("备注")),
+                ft.DataColumn(ft.Text("设备名称")),
+                ft.DataColumn(ft.Text("状态")),
+                ft.DataColumn(ft.Text("规格")),
+                ft.DataColumn(ft.Text("操作"))
+            ],
+            rows=[],
+            border=ft.border.all(1, self.theme_colors['border']),
+            border_radius=8,
+            heading_row_color=self.theme_colors['table_header'],
+            heading_row_height=40,
+            data_row_min_height=40,
+            data_row_max_height=60,
+            expand=True
+        )
+        
+        # 设备表格容器
+        devices_container = ft.Container(
+            content=self.autodl_devices_table,
+            expand=True,
+            border_radius=8,
+            padding=10
+        )
+        
+        # 控制按钮
+        self.autodl_refresh_button = ft.ElevatedButton(
+            text="刷新并检测GPU",
+            on_click=lambda e: self.autodl_refresh_devices(),
+            bgcolor=self.theme_colors['secondary'],
+            color=ft.Colors.WHITE,
+            disabled=True
+        )
+        
+        open_list_button = ft.ElevatedButton(
+            text="打开设备列表网页",
+            on_click=lambda e: webbrowser.open('https://www.autodl.com/console/instance/list'),
+            bgcolor=self.theme_colors['primary'],
+            color=ft.Colors.WHITE
+        )
+        
+        # 创建左侧面板
+        return ft.Container(
+            expand=2,
+            content=ft.Column([
+                ft.Text("AutoDL 设备管理", size=18, weight=ft.FontWeight.BOLD, color=self.theme_colors['text']),
+                ft.Row([
+                    self.autodl_status_label,
+                    ft.Container(expand=True)
+                ]),
+                ft.Row([
+                    self.autodl_username_input,
+                    self.autodl_password_input,
+                    self.autodl_login_button,
+                    self.autodl_logout_button
+                ], spacing=10),
+                ft.Row([
+                    self.remember_password_checkbox,
+                    self.show_password_checkbox,
+                    self.auto_login_checkbox
+                ]),
+                ft.Row([
+                    self.visible_radio,
+                    self.headless_radio,
+                    self.silent_refresh_checkbox,
+                    ft.Container(expand=True)
+                ]),
+                ft.Divider(),
+                devices_container,
+                ft.Row([
+                    self.autodl_refresh_button,
+                    open_list_button,
+                    ft.Container(expand=True)
+                ], spacing=10)
+            ], spacing=15, expand=True),
+            padding=10
+        )
+
+    def create_right_panel(self):
+        """创建右侧面板（SSH连接和日志）"""
+        # SSH配置区域
+        self.config_combo = ft.Dropdown(
+            label="备用连接",
+            width=300,
+            border_radius=8,
+            border_color=self.theme_colors['input_border'],
+            bgcolor=self.theme_colors['input_background'],
+            text_size=14
+        )
+        
+        self.save_config_button = ft.ElevatedButton(
+            text="保存",
+            on_click=self.save_config,
+            bgcolor=self.theme_colors['primary'],
+            color=ft.Colors.WHITE,
+            height=40
+        )
+        
+        self.delete_config_button = ft.ElevatedButton(
+            text="删除",
+            on_click=self.delete_config,
+            bgcolor=self.theme_colors['error'],
+            color=ft.Colors.WHITE,
+            height=40,
+            disabled=True
+        )
+        
+        self.delete_all_button = ft.ElevatedButton(
+            text="删除全部",
+            on_click=self.delete_all_configs,
+            bgcolor=self.theme_colors['error'],
+            color=ft.Colors.WHITE,
+            height=40
+        )
+        
+        # SSH输入字段
+        self.ssh_info_input = ft.TextField(
+            label="SSH连接",
+            hint_text="ssh -p 端口 用户名@主机地址",
+            border_radius=8,
+            border_color=self.theme_colors['input_border'],
+            bgcolor=self.theme_colors['input_background'],
+            text_size=14,
+            on_change=self.auto_parse_ssh_info
+        )
+        
+        self.remote_port_input = ft.TextField(
+            label="远程端口",
+            hint_text="6006",
+            width=200,
+            border_radius=8,
+            border_color=self.theme_colors['input_border'],
+            bgcolor=self.theme_colors['input_background'],
+            text_size=14
+        )
+        
+        self.password_input = ft.TextField(
+            label="密码",
+            password=True,
+            can_reveal_password=True,
+            border_radius=8,
+            border_color=self.theme_colors['input_border'],
+            bgcolor=self.theme_colors['input_background'],
+            text_size=14
+        )
+        
+        self.auto_open_browser_checkbox = ft.Checkbox(
+            label="连接成功后自动打开浏览器",
+            value=True
+        )
+        
+        # 连接按钮
+        self.connect_button = ft.ElevatedButton(
+            text="连接",
+            on_click=self.toggle_connection,
+            bgcolor=self.theme_colors['success'],
+            color=ft.Colors.WHITE,
+            height=40,
+            width=120
+        )
+        
+        self.disconnect_button = ft.ElevatedButton(
+            text="断开",
+            on_click=self.disconnect,
+            bgcolor=self.theme_colors['error'],
+            color=ft.Colors.WHITE,
+            height=40,
+            width=120,
+            disabled=True
+        )
+        
+        # 状态标签
+        self.status_label = ft.Text(
+            "状态: 未连接",
+            size=16,
+            weight=ft.FontWeight.BOLD,
+            color=self.theme_colors['secondary_text']
+        )
+        
+        # 日志区域
+        self.log_list = ft.ListView(
+            expand=True,
+            auto_scroll=True,
+            spacing=2
+        )
+        
+        self.log_container = ft.Container(
+            content=ft.Column([
+                ft.Text("日志输出:", size=14, weight=ft.FontWeight.BOLD, color=self.theme_colors['text']),
+                ft.Container(
+                    content=self.log_list,
+                    expand=True,
+                    border=ft.border.all(1, self.theme_colors['border']),
+                    border_radius=8,
+                    padding=10,
+                    bgcolor=self.theme_colors['log_background']
+                )
+            ], spacing=5, expand=True),
+            expand=True
+        )
+        
+        # 创建右侧面板
+        return ft.Container(
+            expand=1,
+            content=ft.Column([
+                self.status_label,
+                ft.Row([
+                    self.config_combo,
+                    self.save_config_button,
+                    self.delete_config_button,
+                    self.delete_all_button
+                ], spacing=10),
+                self.ssh_info_input,
+                ft.Row([
+                    self.remote_port_input,
+                    ft.Container(expand=True)
+                ]),
+                self.password_input,
+                self.auto_open_browser_checkbox,
+                ft.Row([
+                    self.connect_button,
+                    self.disconnect_button,
+                    ft.Container(expand=True)
+                ]),
+                ft.Divider(),
+                self.log_container
+            ], spacing=15, expand=True),
+            padding=10
+        )
+
+    def apply_theme(self):
+        """应用主题颜色"""
+        if self.current_theme == 'dark':
+            self.theme_colors = {
+                'background': ft.Colors.BLACK12,
+                'card_background': ft.Colors.SURFACE,
+                'title_bar': ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                'border': ft.Colors.OUTLINE,
+                'divider': ft.Colors.OUTLINE_VARIANT,
+                'text': ft.Colors.ON_SURFACE,
+                'secondary_text': ft.Colors.ON_SURFACE_VARIANT,
+                'primary': ft.Colors.PRIMARY,
+                'secondary': ft.Colors.SECONDARY,
+                'success': ft.Colors.GREEN,
+                'error': ft.Colors.RED,
+                'input_background': ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                'input_border': ft.Colors.OUTLINE,
+                'log_background': ft.Colors.BLACK12,
+                'table_header': ft.Colors.SURFACE_CONTAINER_HIGHEST
+            }
+            self.page.theme_mode = ft.ThemeMode.DARK
+        else:
+            self.theme_colors = {
+                'background': ft.Colors.GREY_50,
+                'card_background': ft.Colors.WHITE,
+                'title_bar': ft.Colors.BLUE_GREY_50,
+                'border': ft.Colors.GREY_300,
+                'divider': ft.Colors.GREY_400,
+                'text': ft.Colors.BLACK87,
+                'secondary_text': ft.Colors.BLACK54,
+                'primary': ft.Colors.BLUE,
+                'secondary': ft.Colors.BLUE_GREY,
+                'success': ft.Colors.GREEN,
+                'error': ft.Colors.RED,
+                'input_background': ft.Colors.WHITE,
+                'input_border': ft.Colors.GREY_400,
+                'log_background': ft.Colors.WHITE,
+                'table_header': ft.Colors.BLUE_GREY_50
+            }
+            self.page.theme_mode = ft.ThemeMode.LIGHT
+            
+        # 更新UI组件颜色
+        if hasattr(self, 'main_container'):
+            self._update_ui_colors()
+
+    def _update_ui_colors(self):
+        """更新UI组件颜色"""
+        try:
+            # 主容器
+            self.main_container.bgcolor = self.theme_colors['background']
+            
+            # 内容卡片
+            self.content_card.bgcolor = self.theme_colors['card_background']
+            self.content_card.border = ft.border.all(2, self.theme_colors['border'])
+            
+            # 标题栏
+            self.title_bar.bgcolor = self.theme_colors['title_bar']
+            self.title_bar.border = ft.border.only(bottom=ft.border.BorderSide(1, self.theme_colors['border']))
+            # 标题栏文本
+            if self.title_bar.content and isinstance(self.title_bar.content, ft.Row):
+                self.title_bar.content.controls[0].color = self.theme_colors['text']
+                # 切换图标
+                self.title_bar.content.controls[2].icon = ft.Icons.DARK_MODE if self.current_theme == 'light' else ft.Icons.LIGHT_MODE
+            
+            # 左侧面板组件
+            inputs = [
+                self.autodl_username_input, self.autodl_password_input,
+                self.config_combo, self.ssh_info_input, 
+                self.remote_port_input, self.password_input
+            ]
+            for input_field in inputs:
+                if input_field:
+                    input_field.bgcolor = self.theme_colors['input_background']
+                    input_field.border_color = self.theme_colors['input_border']
+            
+            # 按钮颜色 (需要根据具体按钮类型调整)
+            # 这里只更新那些使用通用颜色的，特定颜色的(success/error)保持原样或重新映射
+            # 实际上success/error也是theme_colors的一部分，所以更新它们是安全的
+            
+            self.autodl_login_button.bgcolor = self.theme_colors['primary']
+            self.autodl_logout_button.bgcolor = self.theme_colors['error']
+            self.autodl_refresh_button.bgcolor = self.theme_colors['secondary']
+            
+            self.save_config_button.bgcolor = self.theme_colors['primary']
+            self.delete_config_button.bgcolor = self.theme_colors['error']
+            self.delete_all_button.bgcolor = self.theme_colors['error']
+            self.connect_button.bgcolor = self.theme_colors['success']
+            self.disconnect_button.bgcolor = self.theme_colors['error']
+            
+            # 表格
+            self.autodl_devices_table.border = ft.border.all(1, self.theme_colors['border'])
+            self.autodl_devices_table.heading_row_color = self.theme_colors['table_header']
+            
+            # 日志容器
+            if hasattr(self, 'log_container'):
+                # log_container content is Column, its 2nd child is the Container holding ListView
+                log_col = self.log_container.content
+                if log_col and len(log_col.controls) >= 2:
+                    log_col.controls[0].color = self.theme_colors['text']
+                    log_box = log_col.controls[1]
+                    log_box.bgcolor = self.theme_colors['log_background']
+                    log_box.border = ft.border.all(1, self.theme_colors['border'])
+            
+            # 状态标签
+            # 注意：状态标签颜色可能取决于连接状态，这里只更新未连接/未登录状态的颜色
+            if not self.is_connected:
+                self.status_label.color = self.theme_colors['secondary_text']
+            if not self.is_autodl_logged_in:
+                self.autodl_status_label.color = self.theme_colors['secondary_text']
+                
+            # 分割线
+            if hasattr(self, 'body_content'):
+                # body_content -> Row -> VerticalDivider (index 1)
+                row = self.body_content.content
+                if row and len(row.controls) >= 2:
+                    row.controls[1].color = self.theme_colors['divider']
+
+            # 更新日志文本颜色
+            if hasattr(self, 'log_list'):
+                for control in self.log_list.controls:
+                    if isinstance(control, ft.Text):
+                        control.color = self.theme_colors['text']
+
+        except Exception as e:
+            print(f"Update theme failed: {e}")
+
+    def setup_event_handlers(self):
+        """设置事件处理程序"""
+        # 密码显示切换
+        self.show_password_checkbox.on_change = lambda e: self.toggle_password_visibility()
+        
+        # 配置选择变化
+        self.config_combo.on_change = lambda e: self.load_selected_config()
+        
+        # AutoDL偏好设置变化
+        self.visible_radio.on_change = lambda e: self._persist_login_prefs()
+        self.headless_radio.on_change = lambda e: self._persist_login_prefs()
+        self.auto_login_checkbox.on_change = lambda e: self._persist_login_prefs()
+        self.silent_refresh_checkbox.on_change = lambda e: self._persist_login_prefs()
+
+    def toggle_theme(self, e=None):
+        """切换主题"""
+        if self.current_theme == 'light':
+            self.current_theme = 'dark'
+        else:
+            self.current_theme = 'light'
+        self.apply_theme()
+        self._persist_login_prefs()
+        self.page.update()
+
+    def open_readme(self, e=None):
+        """打开README文件"""
+        try:
+            p = self.readme_path or os.path.join(self.portable_base_dir, 'README.md')
+            if not os.path.exists(p):
+                p = self._ensure_readme_file()
+            if p and os.path.exists(p):
+                os.startfile(p)
+        except Exception:
+            pass
+
+    def update_status(self, message):
+        """更新状态日志"""
+        timestamp = time.strftime('%H:%M:%S')
+        log_entry = ft.Text(f"[{timestamp}] {message}", size=12, color=self.theme_colors['text'], selectable=True)
+        self.log_list.controls.append(log_entry)
+        try:
+            self.log_list.update()
+        except Exception:
+            self.page.update()
+
+    def update_connection_status(self, is_connected):
+        """更新连接状态"""
+        self.is_connected = is_connected
+        if is_connected:
+            self.status_label.value = "状态: 已连接"
+            self.status_label.color = ft.Colors.GREEN
+            self.connect_button.disabled = True
+            self.disconnect_button.disabled = False
+        else:
+            self.status_label.value = "状态: 未连接"
+            self.status_label.color = self.theme_colors['secondary_text']
+            self.connect_button.disabled = False
+            self.disconnect_button.disabled = True
+        self.page.update()
+
+    def update_autodl_status(self, message):
+        """更新AutoDL状态"""
+        timestamp = time.strftime('%H:%M:%S')
+        log_entry = ft.Text(f"[{timestamp}] [AutoDL] {message}", size=12, color=self.theme_colors['text'], selectable=True)
+        self.log_list.controls.append(log_entry)
+        try:
+            self.log_list.update()
+        except Exception:
+            self.page.update()
+
+    def update_autodl_login_status(self, is_logged_in):
+        """更新AutoDL登录状态"""
+        self.is_autodl_logged_in = is_logged_in
+        if is_logged_in:
+            self.autodl_status_label.value = "已登录"
+            self.autodl_status_label.color = ft.Colors.GREEN
+            self.autodl_login_button.disabled = True
+            self.autodl_logout_button.disabled = False
+            self.autodl_refresh_button.disabled = False
+        else:
+            self.autodl_status_label.value = "未登录"
+            self.autodl_status_label.color = self.theme_colors['secondary_text']
+            self.autodl_login_button.disabled = False
+            self.autodl_logout_button.disabled = True
+            self.autodl_refresh_button.disabled = True
+        self.page.update()
+
+    def toggle_password_visibility(self):
+        """切换密码显示"""
+        if self.show_password_checkbox.value:
+            self.password_input.password = False
+        else:
+            self.password_input.password = True
+        self.page.update()
+
+    def auto_parse_ssh_info(self, e=None):
+        """自动解析粘贴的SSH信息"""
+        ssh_info = self.ssh_info_input.value.strip()
+        if ssh_info:
+            port_pattern = r'-L\s+(\d+):localhost:\d+'
+            match = re.search(port_pattern, ssh_info)
+            if match and not self.remote_port_input.value:
+                self.remote_port_input.value = match.group(1)
+                self.page.update()
+
+    def save_autodl_credentials(self, username=None, password=None):
+        """保存AutoDL登录凭据"""
+        try:
+            if username is None:
+                username = self.autodl_username_input.value.strip()
+            if password is None:
+                password = self.autodl_password_input.value
+
+            remember = self.remember_password_checkbox.value
+            
+            if not username:
+                print("DEBUG: 用户名为空，跳过保存")
+                return
+            
+            pwd_to_save = password if remember else ''
+            
+            # 强制启用加密保存
+            try:
+                if pwd_to_save:
+                    enc = _win_dpapi_encrypt(pwd_to_save)
+                    if enc:
+                        pwd_to_save = enc
+            except Exception:
+                pass
+                
+            print(f"DEBUG: 正在保存密码(已脱敏): {'******' if pwd_to_save else 'Empty'}")
+            print(f"DEBUG: 配置文件路径: {self.autodl_credentials_file}")
+
+            credentials = {
+                'username': username,
+                'password': pwd_to_save,
+                'remember_password': remember,
+                'show_password': bool(self.show_password_checkbox.value),
+                'auto_login': bool(self.auto_login_checkbox.value),
+                'silent_refresh': bool(self.silent_refresh_checkbox.value),
+                'theme': getattr(self, 'current_theme', 'light'),
+                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            with open(self.autodl_credentials_file, 'w', encoding='utf-8') as f:
+                json.dump(credentials, f, ensure_ascii=False, indent=2)
+            
+            # 验证保存结果
+            try:
+                with open(self.autodl_credentials_file, 'r', encoding='utf-8') as f:
+                    saved_data = json.load(f)
+                if saved_data.get('password') != pwd_to_save:
+                    print("CRITICAL: 密码保存验证失败！")
+                    self.update_autodl_status('警告：密码保存失败，请重试！')
+                else:
+                    print(f"AutoDL凭据已保存并验证: {username}")
+                    self.update_autodl_status('登录凭据已保存')
+            except Exception as e:
+                print(f"验证保存结果失败: {e}")
+            
+        except Exception as e:
+            print(f"保存AutoDL凭据失败: {e}")
+
+    def _persist_login_prefs(self):
+        """仅保存UI偏好设置，不修改账号密码"""
+        try:
+            # 如果没有配置文件，不创建空的（防止覆盖）
+            if not os.path.exists(self.autodl_credentials_file):
+                return
+
+            credentials = {}
+            try:
+                with open(self.autodl_credentials_file, 'r', encoding='utf-8') as f:
+                    credentials = json.load(f)
+            except Exception:
+                return # 读取失败也不要覆盖
+
+            # 仅更新偏好设置字段，严格保留原有的 username/password/remember_password
+            credentials['auto_login'] = bool(self.auto_login_checkbox.value)
+            credentials['show_password'] = bool(self.show_password_checkbox.value)
+            credentials['silent_refresh'] = bool(self.silent_refresh_checkbox.value)
+            credentials['theme'] = getattr(self, 'current_theme', 'light')
+            
+            # 再次确保 username/password 不会被 None 覆盖
+            if 'username' not in credentials:
+                credentials['username'] = self.autodl_username_input.value.strip()
+            
+            # 写入文件
+            with open(self.autodl_credentials_file, 'w', encoding='utf-8') as f:
+                json.dump(credentials, f, ensure_ascii=False, indent=2)
+                
+        except Exception:
+            pass
+
+    def load_autodl_credentials(self):
+        """加载AutoDL登录凭据"""
+        try:
+            if os.path.exists(self.autodl_credentials_file):
+                print(f"DEBUG: 正在加载配置文件: {self.autodl_credentials_file}")
+                with open(self.autodl_credentials_file, 'r', encoding='utf-8') as f:
+                    credentials = json.load(f)
+                # 加载通用偏好（不依赖记住密码）
+                try:
+                    self.auto_login_checkbox.value = bool(credentials.get('auto_login', False))
+                    self.show_password_checkbox.value = bool(credentials.get('show_password', False))
+                    self.silent_refresh_checkbox.value = bool(credentials.get('silent_refresh', True))
+                    theme = credentials.get('theme', None)
+                    if not theme:
+                        self.current_theme = 'light'
+                    else:
+                        self.current_theme = theme
+                except Exception:
+                    pass
+
+                # 加载用户名/密码（仅在记住密码时）
+                if credentials.get('remember_password', False):
+                    username = credentials.get('username', '')
+                    password = credentials.get('password', '')
+                    if username:
+                        self.autodl_username_input.value = username
+                    if password:
+                        print(f"DEBUG: 从文件加载的原始密码字段: {password}")
+                        try:
+                            dec = _win_dpapi_decrypt(password)
+                            if dec is not None:
+                                password = dec
+                                print(f"DEBUG: 解密成功: {password}")
+                            else:
+                                print("DEBUG: 无需解密或解密返回None")
+                        except Exception as e:
+                            print(f"DEBUG: 解密异常: {e}")
+                            pass
+                        self.autodl_password_input.value = password
+                    self.remember_password_checkbox.value = True
+                    print(f"AutoDL凭据已加载: {username}")
+                    return True
+            
+        except Exception as e:
+            print(f"加载AutoDL凭据失败: {e}")
+        
+        return False
+
+    def save_config(self, e=None):
+        """保存当前配置"""
+        if not self.config_dir:
+            self.show_dialog("配置错误", "配置目录不可用，无法保存配置")
+            return
+
+        ssh_info = self.ssh_info_input.value.strip()
+        remote_port = self.remote_port_input.value.strip()
+        password = self.password_input.value
+        auto_open_browser = self.auto_open_browser_checkbox.value
+
+        if not ssh_info:
+            self.show_dialog("输入错误", "请输入SSH连接信息")
+            return
+
+        if not remote_port:
+            self.show_dialog("输入错误", "请输入远程端口")
+            return
+
+        try:
+            port_num = int(remote_port)
+            if port_num <= 0 or port_num > 65535:
+                raise ValueError()
+        except ValueError:
+            self.show_dialog("输入错误", "请输入有效的端口号（1-65535）")
+            return
+
+        def on_save(dialog_result):
+            if not dialog_result:
+                return
+            config_name = dialog_result.strip()
+            
+            if not config_name:
+                return
+
+            if not re.match(r'^[\w\-\_]+$', config_name):
+                self.show_dialog("名称错误", "配置名称只能包含字母、数字、下划线和连字符")
+                return
+
+            config_data = {
+                'ssh_info': ssh_info,
+                'remote_port': remote_port,
+                'password': password,
+                'auto_open_browser': auto_open_browser,
+                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+
+            try:
+                if password:
+                    if self.encryption_enabled:
+                        enc = _win_dpapi_encrypt(password)
+                        if enc:
+                            config_data['password'] = enc
+                    else:
+                        if not self.encryption_prompted:
+                            # 这里简化处理，直接提示
+                            self._set_encryption_prompted(True)
+            except Exception:
+                pass
+
+            config_file = os.path.join(self.config_dir, f'{config_name}.json')
+
+            if os.path.exists(config_file):
+                def on_confirm(result):
+                    if result == "是":
+                        self._do_save_config(config_name, config_data, config_file)
+                
+                self.show_confirm_dialog("确认覆盖", f'配置 "{config_name}" 已存在，是否覆盖？', on_confirm)
+            else:
+                self._do_save_config(config_name, config_data, config_file)
+
+        # 显示输入对话框
+        self.show_input_dialog("保存配置", "请输入配置名称:", on_save)
+
+    def _do_save_config(self, config_name, config_data, config_file):
+        """执行保存配置"""
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config_data, f, ensure_ascii=False, indent=2)
+
+            self.show_dialog("保存成功", f'配置 "{config_name}" 已成功保存')
+            self.load_config_list()
+            # 选择新保存的配置
+            for i, item in enumerate(self.config_combo.options):
+                if item.key == config_name:
+                    self.config_combo.value = config_name
+                    break
+            self.page.update()
+        except Exception as e:
+            self.show_dialog("保存失败", f'保存配置时出错: {str(e)}')
+
+    def load_config_list(self):
+        """加载保存的配置列表"""
+        try:
+            self.config_combo.options = []
+            self.config_combo.options.append(ft.dropdown.Option("当前输入配置", "当前输入配置"))
+
+            if not self.config_dir or not os.path.exists(self.config_dir):
+                return
+
+            config_files = []
+            try:
+                config_files = [f for f in os.listdir(self.config_dir) if f.endswith('.json')]
+            except PermissionError:
+                self.update_status(f'警告: 没有权限访问配置目录')
+                return
+            except Exception as e:
+                self.update_status(f'警告: 读取配置目录时出错: {str(e)}')
+                return
+
+            for config_file in sorted([f for f in config_files if f != 'device_map.json']):
+                try:
+                    full_path = os.path.join(self.config_dir, config_file)
+                    display_name = os.path.splitext(config_file)[0]
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        if isinstance(data, dict) and data.get('remark'):
+                            display_name = str(data.get('remark'))
+                    self.config_combo.options.append(ft.dropdown.Option(display_name, os.path.splitext(config_file)[0]))
+                except Exception:
+                    self.config_combo.options.append(ft.dropdown.Option(os.path.splitext(config_file)[0], os.path.splitext(config_file)[0]))
+            
+            self.config_combo.value = "当前输入配置"
+            self.page.update()
+        except Exception as e:
+            self.update_status(f'加载配置列表时出错: {str(e)}')
+
+    def load_selected_config(self):
+        """加载选中的配置"""
+        config_name = self.config_combo.value
+        if not config_name or config_name == "当前输入配置":
+            return
+
+        if not self.config_dir:
+            self.show_dialog("配置错误", "配置目录不可用")
+            self.config_combo.value = "当前输入配置"
+            return
+
+        config_file = os.path.join(self.config_dir, f'{config_name}.json')
+
+        if not os.path.exists(config_file):
+            self.show_dialog("文件不存在", f'配置文件不存在: {config_name}')
+            self.load_config_list()
+            return
+
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+
+            if not isinstance(config_data, dict):
+                raise ValueError('配置文件格式错误')
+
+            self.ssh_info_input.value = str(config_data.get('ssh_info', ''))
+            self.remote_port_input.value = str(config_data.get('remote_port', ''))
+            pwd_val = str(config_data.get('password', ''))
+            try:
+                dec = _win_dpapi_decrypt(pwd_val)
+                if dec is not None:
+                    pwd_val = dec
+            except Exception:
+                pass
+            self.password_input.value = pwd_val
+            self.auto_open_browser_checkbox.value = bool(config_data.get('auto_open_browser', True))
+
+            saved_time = config_data.get('saved_at', '未知')
+            remark = str(config_data.get('remark', config_name))
+            self.update_status(f'已加载配置: {remark} (保存时间: {saved_time})')
+            
+            self.page.update()
+        except Exception as e:
+            self.show_dialog("加载失败", f'加载配置时出错: {str(e)}')
+
+    def delete_config(self, e=None):
+        """删除选中的配置"""
+        config_name = self.config_combo.value
+        if not config_name or config_name == "当前输入配置":
+            self.show_dialog("选择错误", "请先选择要删除的配置")
+            return
+
+        if not self.config_dir:
+            self.show_dialog("配置错误", "配置目录不可用")
+            return
+
+        def on_confirm(result):
+            if result == "是":
+                config_file = os.path.join(self.config_dir, f'{config_name}.json')
+                try:
+                    if os.path.exists(config_file):
+                        os.remove(config_file)
+                        self.show_dialog("删除成功", f'配置 "{config_name}" 已成功删除')
+                        self.load_config_list()
+                        self.ssh_info_input.value = ""
+                        self.remote_port_input.value = ""
+                        self.password_input.value = ""
+                        self.page.update()
+                    else:
+                        self.show_dialog("文件不存在", "配置文件不存在或已被删除")
+                        self.load_config_list()
+                except Exception as e:
+                    self.show_dialog("删除失败", f'删除配置时出错: {str(e)}')
+
+        self.show_confirm_dialog("确认删除", f'确定要删除配置 "{config_name}" 吗？\n此操作不可撤销。', on_confirm)
+
+    def delete_all_configs(self, e=None):
+        """删除所有配置"""
+        if not self.config_dir or not os.path.exists(self.config_dir):
+            self.show_dialog("无配置", "配置目录不存在")
+            return
+
+        def on_confirm(result):
+            if result == "是":
+                try:
+                    for f in os.listdir(self.config_dir):
+                        if f.endswith('.json'):
+                            try:
+                                os.remove(os.path.join(self.config_dir, f))
+                            except Exception:
+                                pass
+                    try:
+                        if os.path.exists(self.device_map_file):
+                            os.remove(self.device_map_file)
+                    except Exception:
+                        pass
+                    self.load_config_list()
+                    self.show_dialog("已删除", "已删除全部保存的连接信息")
+                except Exception as e:
+                    self.show_dialog("失败", f'删除全部配置失败: {str(e)}')
+
+        self.show_confirm_dialog("确认删除", "确定要删除全部保存的连接信息吗？此操作不可撤销。", on_confirm)
+
+    def update_delete_button_state(self):
+        """更新删除按钮状态"""
+        config_name = self.config_combo.value
+        if not config_name or config_name == "当前输入配置":
+            self.delete_config_button.disabled = True
+        else:
+            self.delete_config_button.disabled = False
+        self.page.update()
+
+    def toggle_connection(self, e=None):
+        """切换连接状态"""
+        if not self.is_connected:
+            self.connect()
+
+    def parse_ssh_info(self, ssh_info):
+        """解析SSH连接信息"""
+        try:
+            clean_info = ssh_info.strip()
+            tokens = shlex.split(clean_info)
+            port = '22'
+            user = None
+            host = None
+
+            for i, t in enumerate(tokens):
+                if t == '-p' and i + 1 < len(tokens):
+                    if re.match(r'^\d{1,5}$', tokens[i+1]):
+                        port = tokens[i+1]
+                if '@' in t and not user and not host:
+                    u, h = t.split('@', 1)
+                    if u and h:
+                        user = u
+                        host = h
+
+            if not user or not host:
+                m = re.search(r'([\w.-]+)@([\w.-]+)', clean_info)
+                if m:
+                    user = m.group(1)
+                    host = m.group(2)
+
+            if user and host:
+                return host, port, user
+        except Exception as e:
+            self.update_status(f'解析SSH信息时出错: {str(e)}')
+
+        return None, None, None
+
+    def connect(self):
+        """建立SSH连接并设置端口转发"""
+        try:
+            if self.is_connected:
+                self.update_status('已连接，忽略重复连接请求')
+                return
+            if self.is_connecting:
+                self.update_status('正在连接中，请稍候')
+                return
+                
+            ssh_info = self.ssh_info_input.value.strip()
+            remote_port_text = self.remote_port_input.value.strip()
+            password = self.password_input.value
+
+            if not ssh_info:
+                self.show_dialog("输入错误", "请输入SSH连接信息")
+                return
+
+            if not remote_port_text:
+                self.show_dialog("输入错误", "请输入远程端口")
+                return
+
+            try:
+                remote_port = int(remote_port_text)
+                if remote_port <= 0 or remote_port > 65535:
+                    raise ValueError()
+            except ValueError:
+                self.show_dialog("输入错误", "请输入有效的端口号")
+                return
+
+            host, port, username = self.parse_ssh_info(ssh_info)
+            if not host or not username:
+                self.show_dialog("输入错误", "无法解析SSH连接信息，请检查格式\n例如: ssh -p 53372 root@region-41.seetacloud.com")
+                return
+
+            host = host.split()[0]
+
+            self.is_connecting = True
+            self.forward_thread = threading.Thread(
+                target=self._connect_thread,
+                args=(host, port, username, password, remote_port)
+            )
+            self.forward_thread.daemon = True
+            self.forward_thread.start()
+        except Exception as e:
+            self.show_dialog("错误", f'启动连接过程中出错: {str(e)}')
+
+    def _connect_thread(self, host, port, username, password, remote_port):
+        """在新线程中执行SSH连接和端口转发"""
+        try:
+            try:
+                self.stop_event.clear()
+            except Exception:
+                pass
+            self.update_status(f'正在连接到 {username}@{host}:{port}...')
+            try:
+                self._last_connect_args = (host, port, username, password, remote_port)
+            except Exception:
+                pass
+
+            try:
+                logging.getLogger('paramiko').setLevel(logging.WARNING)
+            except Exception:
+                pass
+
+            self.ssh_client = paramiko.SSHClient()
+            self.update_status('自动接受主机密钥（相当于输入yes）')
+            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            self.update_status('正在进行密码认证...')
+            self.ssh_client.connect(
+                hostname=host,
+                port=int(port),
+                username=username,
+                password=password,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=30
+            )
+
+            self.update_status('SSH连接成功')
+
+            transport = self.ssh_client.get_transport()
+            if not transport:
+                raise Exception('无法获取SSH传输通道')
+            try:
+                transport.set_keepalive(30)
+            except Exception:
+                pass
+
+            self.update_status(f'正在设置端口转发: 本地端口 {remote_port} -> 远程端口 {remote_port}')
+
+            self.update_connection_status(True)
+            self.is_connected = True
+            try:
+                self.is_connecting = False
+            except Exception:
+                pass
+
+            try:
+                server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.bind(('127.0.0.1', remote_port))
+                server_socket.listen(5)
+                server_socket.settimeout(1)
+                self.update_status(f'本地监听器已启动在端口 {remote_port}')
+                try:
+                    self.server_socket = server_socket
+                except Exception:
+                    pass
+            except Exception as e:
+                self.update_status(f'本地端口监听失败: 端口可能被占用或权限不足: {str(e)}')
+                self.update_connection_status(False)
+                return
+
+            if self.auto_open_browser_checkbox.value:
+                self.port_forwarding_setup = True
+                self.update_status('等待端口转发完全建立...')
+                ready = False
+                start_t = time.time()
+                attempt = 0
+                while (time.time() - start_t < 300) and (not self.stop_event.is_set()) and self.is_connected:
+                    try:
+                        t = None
+                        try:
+                            t = self.ssh_client.get_transport()
+                        except Exception:
+                            t = None
+                        if t and t.is_active():
+                            try:
+                                ch = t.open_channel('direct-tcpip', ('127.0.0.1', remote_port), ('127.0.0.1', 0))
+                                if ch:
+                                    try:
+                                        ch.close()
+                                    except Exception:
+                                        pass
+                                    ready = True
+                                    break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    attempt += 1
+                    sleep_interval = 0.5 + min(attempt * 0.25, 2.0)
+                    time.sleep(sleep_interval)
+                if ready:
+                    url = f'http://127.0.0.1:{remote_port}'
+                    self.update_status(f'正在打开浏览器: {url}')
+                    try:
+                        success = webbrowser.open(url)
+                        if success:
+                            self.update_status(f'浏览器已成功打开: {url}')
+                        else:
+                            self.update_status('无法打开浏览器，请手动访问: ' + url)
+                    except Exception as e:
+                        self.update_status(f'打开浏览器时出错: {str(e)}，请手动访问: ' + url)
+                else:
+                    if not self.stop_event.is_set() and self.is_connected:
+                        self.update_status('端口转发尚未可用，未打开浏览器')
+                self.port_forwarding_setup = False
+
+            if self.is_connected and not self.stop_event.is_set():
+                self.update_status('端口转发已设置，连接保持活跃中...')
+
+            browser_opened = False
+            if self.auto_open_browser_checkbox.value:
+                if ready:
+                    browser_opened = True
+            last_browser_try = 0.0
+            while self.is_connected and not self.stop_event.is_set():
+                try:
+                    tcur = None
+                    try:
+                        tcur = self.ssh_client.get_transport()
+                    except Exception:
+                        tcur = None
+                    if (not tcur) or (not tcur.is_active()):
+                        okr = self._reconnect_in_place()
+                        if not okr:
+                            time.sleep(1.0)
+                            continue
+                        try:
+                            transport = self.ssh_client.get_transport()
+                        except Exception:
+                            transport = None
+                        if not transport or not transport.is_active():
+                            time.sleep(1.0)
+                            continue
+                    if self.auto_open_browser_checkbox.value and not browser_opened:
+                        now = time.time()
+                        if now - last_browser_try >= 3.0:
+                            last_browser_try = now
+                            try:
+                                ch2 = tcur.open_channel('direct-tcpip', ('127.0.0.1', remote_port), ('127.0.0.1', 0))
+                                if ch2:
+                                    try:
+                                        ch2.close()
+                                    except Exception:
+                                        pass
+                                    url2 = f'http://127.0.0.1:{remote_port}'
+                                    try:
+                                        okweb = webbrowser.open(url2)
+                                        if okweb:
+                                            self.update_status(f'浏览器已成功打开: {url2}')
+                                        else:
+                                            self.update_status('无法打开浏览器，请手动访问: ' + url2)
+                                    except Exception as e:
+                                        self.update_status(f'打开浏览器时出错: {str(e)}，请手动访问: ' + url2)
+                                    browser_opened = True
+                            except Exception:
+                                pass
+                    readable, _, _ = select.select([server_socket], [], [], 0.2)
+                    if readable:
+                        client_socket, addr = server_socket.accept()
+                        try:
+                            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        except Exception:
+                            pass
+                        client_thread = threading.Thread(
+                            target=self._handle_client,
+                            args=(client_socket, transport, remote_port)
+                        )
+                        client_thread.daemon = True
+                        client_thread.start()
+                        try:
+                            self.client_threads.append(client_thread)
+                        except Exception:
+                            pass
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.is_connected and not self.stop_event.is_set():
+                        okreb = self._recreate_server_socket(remote_port)
+                        if not okreb:
+                            time.sleep(1.0)
+                            continue
+                        try:
+                            server_socket = self.server_socket
+                        except Exception:
+                            pass
+
+        except paramiko.AuthenticationException:
+            self.update_status('认证失败: 用户名或密码错误')
+            self.update_connection_status(False)
+        except paramiko.SSHException as e:
+            self.update_status(f'SSH错误: {str(e)}')
+            self.update_connection_status(False)
+        except Exception as e:
+            self.update_status(f'连接错误: {str(e)}')
+            self.update_connection_status(False)
+        finally:
+            try:
+                self.is_connecting = False
+            except Exception:
+                pass
+            if 'server_socket' in locals():
+                try:
+                    server_socket.close()
+                except:
+                    pass
+
+    def _handle_client(self, client_socket, transport, remote_port):
+        """处理单个客户端连接的端口转发"""
+        try:
+            try:
+                tt = None
+                try:
+                    tt = self.ssh_client.get_transport()
+                except Exception:
+                    tt = None
+                if not tt or not tt.is_active():
+                    ok_re = self._reconnect_in_place()
+                    if ok_re:
+                        try:
+                            tt = self.ssh_client.get_transport()
+                        except Exception:
+                            tt = None
+                if not tt or not tt.is_active():
+                    raise paramiko.SSHException('SSH session not active')
+                channel = tt.open_channel(
+                    'direct-tcpip',
+                    ('127.0.0.1', remote_port),
+                    ('127.0.0.1', client_socket.getsockname()[1])
+                )
+            except paramiko.SSHException as e:
+                self.update_status(f'无法创建到远程端口的通道，服务器可能禁止端口转发或目标不可达: {str(e)}')
+                client_socket.close()
+                return
+
+            if not channel:
+                self.update_status('无法创建到远程服务器的通道')
+                client_socket.close()
+                return
+
+            self.update_status(f'已建立到远程端口 {remote_port} 的转发通道')
+
+            while self.is_connected and not self.stop_event.is_set():
+                r, _, _ = select.select([client_socket, channel], [], [], 0.08)
+
+                if client_socket in r:
+                    data = client_socket.recv(4096)
+                    if not data:
+                        break
+                    channel.send(data)
+
+                if channel in r:
+                    data = channel.recv(4096)
+                    if not data:
+                        break
+                    client_socket.send(data)
+
+        except Exception as e:
+            if self.is_connected:
+                self.update_status(f'客户端连接错误: {str(e)}')
+        finally:
+            try:
+                client_socket.close()
+            except:
+                pass
+            try:
+                if 'channel' in locals():
+                    channel.close()
+            except:
+                pass
+
+            self.update_status('客户端连接已关闭')
+
+    def _reconnect_in_place(self, max_retries=10):
+        """重连机制"""
+        try:
+            if self.stop_event.is_set():
+                return False
+            if self.reconnecting:
+                return False
+            args = getattr(self, '_last_connect_args', None)
+            if not args or len(args) != 5:
+                return False
+            self.reconnecting = True
+            host, port, username, password, remote_port = args
+            attempt = 0
+            while attempt < max_retries:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    if self._detect_device_shutdown_for_reconnect():
+                        self.update_status('检测到设备已关机，停止重连')
+                        self.reconnecting = False
+                        return False
+                except Exception:
+                    pass
+                try:
+                    if attempt == 0:
+                        time.sleep(min(2 ** attempt, 60))
+                except Exception:
+                    pass
+                c = paramiko.SSHClient()
+                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                try:
+                    c.connect(
+                        hostname=host,
+                        port=int(port),
+                        username=username,
+                        password=password,
+                        look_for_keys=False,
+                        allow_agent=False,
+                        timeout=20
+                    )
+                    try:
+                        t = c.get_transport()
+                        if t:
+                            try:
+                                t.set_keepalive(30)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    self.ssh_client = c
+                    self.update_status('重连成功')
+                    self.reconnecting = False
+                    return True
+                except Exception as e:
+                    attempt += 1
+                    wait = min(2 ** attempt, 60)
+                    try:
+                        self.update_status(f'重连失败 ({attempt}/{max_retries})，{wait}秒后重试...')
+                    except Exception:
+                        pass
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        time.sleep(wait)
+                    except Exception:
+                        pass
+            try:
+                self.update_status('达到最大重试次数，放弃连接')
+            except Exception:
+                pass
+            try:
+                self.disconnect()
+            except Exception:
+                pass
+            self.reconnecting = False
+            return False
+        except Exception:
+            try:
+                self.reconnecting = False
+            except Exception:
+                pass
+            return False
+
+    def _detect_device_shutdown_for_reconnect(self):
+        """检测设备是否关机"""
+        try:
+            if not getattr(self, 'autodl_driver', None) or not getattr(self, 'is_autodl_logged_in', False):
+                return False
+            did = getattr(self, 'await_running_device_id', None)
+            rem = getattr(self, 'await_running_remark', None)
+            if not did and not rem:
+                return False
+            try:
+                self._goto_instance_list()
+            except Exception:
+                pass
+            r = None
+            if did:
+                try:
+                    r = self._find_row_by_device_id(did)
+                except Exception:
+                    r = None
+            if r is None and rem:
+                try:
+                    r = self._find_row_by_remark(rem)
+                except Exception:
+                    r = None
+            if r:
+                try:
+                    return bool(self._is_stopped_row(r))
+                except Exception:
+                    return False
+            return False
+        except Exception:
+            return False
+
+    def _recreate_server_socket(self, remote_port):
+        """重新创建服务器socket"""
+        try:
+            if self.server_socket:
+                try:
+                    self.server_socket.close()
+                except Exception:
+                    pass
+                self.server_socket = None
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('127.0.0.1', remote_port))
+            s.listen(5)
+            s.settimeout(1)
+            self.server_socket = s
+            self.update_status(f'本地监听器已重建在端口 {remote_port}')
+            return True
+        except Exception as e:
+            self.update_status(f'本地监听器重建失败: {str(e)}')
+            return False
+
+    def disconnect(self, e=None):
+        """断开SSH连接"""
+        try:
+            self.update_status('正在断开连接...')
+            self.is_connected = False
+            try:
+                self.stop_event.set()
+            except Exception:
+                pass
+
+            time.sleep(0.5)
+
+            try:
+                if self.server_socket:
+                    try:
+                        self.server_socket.close()
+                    except Exception:
+                        pass
+                    self.server_socket = None
+                    self.update_status('端口监听已关闭')
+            except Exception:
+                pass
+
+            if self.ssh_client:
+                try:
+                    self.ssh_client.close()
+                    self.update_status('SSH连接已关闭')
+                except Exception as e:
+                    self.update_status(f'关闭SSH连接时出错: {str(e)}')
+                finally:
+                    self.ssh_client = None
+
+            try:
+                if self.forward_thread:
+                    pass
+                self.forward_thread = None
+            except Exception:
+                self.forward_thread = None
+
+            try:
+                if hasattr(self, 'client_threads') and self.client_threads:
+                    self.client_threads = []
+                    self.update_status('所有客户端连接已关闭')
+            except Exception:
+                pass
+
+            self.update_connection_status(False)
+            self.update_status('连接已完全断开')
+        except Exception as e:
+            self.show_dialog("错误", f'断开连接过程中出错: {str(e)}')
+            self.is_connected = False
+            self.ssh_client = None
+            self.forward_thread = None
+            self.update_connection_status(False)
+
+    # AutoDL相关方法（保持原功能）
+    def init_autodl_driver(self, headless=True):
+        """初始化AutoDL浏览器驱动"""
+        try:
+            # 强力清理之前的残留进程
+            try:
+                import subprocess
+                startupinfo = None
+                if os.name == 'nt':
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                subprocess.run(['taskkill', '/F', '/IM', 'chromedriver.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
+                subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
+            except: pass
+
+            self.update_autodl_status('正在启动浏览器...')
+            chrome_options = Options()
+            try:
+                chrome_options.page_load_strategy = 'eager'
+            except Exception:
+                pass
+            if headless:
+                chrome_options.add_argument('--headless=new')
+                chrome_options.add_argument('--window-size=1366,900')
+            else:
+                chrome_options.add_argument('--window-size=1366,900')
+            
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--disable-extensions')
+            chrome_options.add_argument('--disable-plugins')
+            chrome_options.add_argument('--disable-notifications')
+            chrome_options.add_argument('--disable-background-networking')
+            chrome_options.add_argument('--disable-sync')
+            chrome_options.add_argument('--disable-translate')
+            chrome_options.add_argument('--disable-application-cache')
+            chrome_options.add_argument('--disk-cache-size=0')
+            chrome_options.add_argument('--dns-prefetch-disable')
+            chrome_options.add_argument('--no-first-run')
+            chrome_options.add_argument('--no-default-browser-check')
+            chrome_options.add_argument('--remote-debugging-port=0')
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            try:
+                profile_dir = os.path.join(self.config_dir, 'chrome_profile_headless' if headless else 'chrome_profile')
+                os.makedirs(profile_dir, exist_ok=True)
+                self._cleanup_chrome_profile(profile_dir)
+                chrome_options.add_argument(f'--user-data-dir={profile_dir}')
+                chrome_options.add_argument('--profile-directory=Default')
+            except Exception:
+                pass
+            chrome_options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2, "credentials_enable_service": True, "profile.password_manager_enabled": True})
+            
+            driver_path = None
+            driver_path_file = os.path.join(self.config_dir, 'chromedriver.path')
+            
+            possible_drivers = [
+                os.path.join(self.config_dir, 'chromedriver.exe'),
+                os.path.join(os.getcwd(), 'chromedriver.exe'),
+                os.path.join(os.getcwd(), 'assets', 'chromedriver.exe'),
+                os.path.join(os.path.dirname(sys.executable), 'chromedriver.exe'),
+            ]
+            
+            if os.path.exists(driver_path_file):
+                try:
+                    with open(driver_path_file, 'r', encoding='utf-8') as f:
+                        dp = f.read().strip()
+                        if dp and os.path.exists(dp):
+                            possible_drivers.insert(0, dp)
+                except Exception:
+                    pass
+
+            self.autodl_driver = None
+            
+            # 1. 尝试使用找到的本地驱动
+            for dp in possible_drivers:
+                if dp and os.path.exists(dp):
+                    try:
+                        if os.path.getsize(dp) < 1024 * 1024:
+                             print(f"DEBUG: 本地驱动 {dp} 过小，跳过")
+                             try: os.remove(dp) 
+                             except: pass
+                             continue
+                    except: pass
+
+                    try:
+                        print(f"DEBUG: 尝试使用本地驱动: {dp}")
+                        service = Service(executable_path=dp)
+                        if os.name == 'nt':
+                            try: service.creation_flags = subprocess.CREATE_NO_WINDOW
+                            except: pass
+                        self.autodl_driver = webdriver.Chrome(service=service, options=chrome_options)
+                        self.update_autodl_status('使用本地驱动启动成功')
+                        try:
+                            with open(driver_path_file, 'w', encoding='utf-8') as f:
+                                f.write(dp)
+                        except: pass
+                        break
+                    except Exception as e:
+                        print(f"DEBUG: 本地驱动 {dp} 启动失败: {e}")
+                        self.autodl_driver = None
+                        if dp == os.path.join(self.config_dir, 'chromedriver.exe'):
+                            try:
+                                os.remove(dp)
+                                print(f"DEBUG: 已删除损坏的本地驱动: {dp}")
+                            except: pass
+                        if os.path.exists(driver_path_file):
+                            try:
+                                with open(driver_path_file, 'r') as f:
+                                    if f.read().strip() == dp:
+                                        f.close()
+                                        os.remove(driver_path_file)
+                            except: pass
+            
+            # 2. 尝试系统PATH中的驱动
+            if not self.autodl_driver:
+                try:
+                    print("DEBUG: 尝试使用系统PATH驱动")
+                    self.autodl_driver = webdriver.Chrome(options=chrome_options)
+                    self.update_autodl_status('使用系统驱动启动成功')
+                except Exception:
+                    self.autodl_driver = None
+
+            # 3. 如果都失败，使用ChromeDriverManager下载/更新
+            if not self.autodl_driver:
+                self.update_autodl_status('正在验证浏览器驱动(首次运行可能较慢，下次将秒开)...')
+                
+                old_wdm_local = os.environ.get('WDM_LOCAL')
+                os.environ['WDM_SSL_VERIFY'] = '0'
+                path = None
+
+                try:
+                    print("DEBUG: 尝试使用 WDM 本地缓存...")
+                    os.environ['WDM_LOCAL'] = '1'
+                    path = ChromeDriverManager().install()
+                    service = Service(executable_path=path)
+                    if os.name == 'nt':
+                        try: service.creation_flags = subprocess.CREATE_NO_WINDOW
+                        except: pass
+                    self.autodl_driver = webdriver.Chrome(service=service, options=chrome_options)
+                    print("DEBUG: WDM 本地缓存驱动启动成功")
+                except Exception as e:
+                    print(f"DEBUG: WDM 缓存启动失败: {e}")
+                    self.autodl_driver = None
+                    
+                    try:
+                        print("DEBUG: 尝试联网更新驱动...")
+                        os.environ['WDM_LOCAL'] = '0'
+                        path = ChromeDriverManager().install()
+                        service = Service(executable_path=path)
+                        if os.name == 'nt':
+                            try: service.creation_flags = subprocess.CREATE_NO_WINDOW
+                            except: pass
+                        self.autodl_driver = webdriver.Chrome(service=service, options=chrome_options)
+                    except Exception as e2:
+                        print(f"DEBUG: 联网更新失败: {e2}")
+                        raise Exception(f"无法初始化浏览器驱动，请检查网络连接: {e2}")
+                finally:
+                    if old_wdm_local is None:
+                        os.environ.pop('WDM_LOCAL', None)
+                    else:
+                        os.environ['WDM_LOCAL'] = old_wdm_local
+
+                if self.autodl_driver and path:
+                    try:
+                        with open(driver_path_file, 'w', encoding='utf-8') as f:
+                            f.write(path)
+                        
+                        try:
+                            import shutil
+                            local_backup = os.path.join(self.config_dir, 'chromedriver.exe')
+                            if os.path.abspath(path) != os.path.abspath(local_backup):
+                                shutil.copy2(path, local_backup)
+                                print(f"DEBUG: 已将驱动备份到: {local_backup}")
+                        except Exception as e:
+                            print(f"DEBUG: 驱动备份失败: {e}")
+                    except Exception:
+                        pass
+
+            try:
+                self.autodl_driver.set_page_load_timeout(8)
+            except Exception:
+                pass
+            try:
+                self.autodl_driver.implicitly_wait(0)
+            except Exception:
+                pass
+            self.autodl_driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            self.update_autodl_status('浏览器启动成功')
+            return True
+        except Exception as e:
+            msg = str(e)
+            try:
+                import tempfile
+                tmp_dir = tempfile.mkdtemp(prefix='chrometmp-', dir=self.config_dir)
+                fallback_options = Options()
+                if headless:
+                    fallback_options.add_argument('--headless=new')
+                    fallback_options.add_argument('--window-size=1366,900')
+                else:
+                    fallback_options.add_argument('--window-size=1366,900')
+                fallback_options.add_argument('--no-sandbox')
+                fallback_options.add_argument('--disable-dev-shm-usage')
+                fallback_options.add_argument('--disable-extensions')
+                fallback_options.add_argument('--no-first-run')
+                fallback_options.add_argument('--no-default-browser-check')
+                fallback_options.add_argument('--remote-debugging-port=0')
+                fallback_options.add_argument(f'--user-data-dir={tmp_dir}')
+                fallback_options.add_argument('--profile-directory=Default')
+                fallback_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                fallback_options.add_experimental_option('useAutomationExtension', False)
+                fallback_options.add_experimental_option("prefs", {"credentials_enable_service": True, "profile.password_manager_enabled": True})
+                
+                self.autodl_driver = None
+                
+                if driver_path:
+                    try:
+                        service = Service(executable_path=driver_path)
+                        self.autodl_driver = webdriver.Chrome(service=service, options=fallback_options)
+                    except Exception:
+                        self.autodl_driver = None
+                
+                if not self.autodl_driver:
+                    try:
+                        os.environ['WDM_LOCAL'] = '1'
+                        path = ChromeDriverManager().install()
+                        service = Service(executable_path=path)
+                        self.autodl_driver = webdriver.Chrome(service=service, options=fallback_options)
+                    except Exception:
+                        try:
+                            os.environ['WDM_LOCAL'] = '0'
+                            path = ChromeDriverManager().install()
+                            service = Service(executable_path=path)
+                            self.autodl_driver = webdriver.Chrome(service=service, options=fallback_options)
+                            try:
+                                with open(driver_path_file, 'w', encoding='utf-8') as f:
+                                    f.write(path)
+                            except Exception:
+                                pass
+                        except Exception:
+                             self.autodl_driver = webdriver.Chrome(options=fallback_options)
+
+                try:
+                    self.autodl_driver.set_page_load_timeout(8)
+                except Exception:
+                    pass
+                try:
+                    self.autodl_driver.implicitly_wait(0)
+                except Exception:
+                    pass
+                
+                return True
+            except Exception as e2:
+                if headless:
+                    try:
+                        visible_options = Options()
+                        visible_options.add_argument('--window-size=1366,900')
+                        visible_options.add_argument('--no-first-run')
+                        visible_options.add_argument('--no-default-browser-check')
+                        visible_options.add_argument('--remote-debugging-port=0')
+                        try:
+                            profile_dir2 = os.path.join(self.config_dir, 'chrome_profile_visible')
+                            os.makedirs(profile_dir2, exist_ok=True)
+                            visible_options.add_argument(f'--user-data-dir={profile_dir2}')
+                            visible_options.add_argument('--profile-directory=Default')
+                        except Exception:
+                            pass
+                        visible_options.add_experimental_option("prefs", {"credentials_enable_service": True, "profile.password_manager_enabled": True})
+                        try:
+                            self.autodl_driver = webdriver.Chrome(options=visible_options)
+                        except Exception:
+                            service = Service(ChromeDriverManager().install())
+                            self.autodl_driver = webdriver.Chrome(service=service, options=visible_options)
+                        
+                        return True
+                    except Exception:
+                        pass
+                self.update_autodl_status(f'Chrome浏览器初始化失败: {msg}')
+                self.update_autodl_status('Chrome浏览器最终初始化失败')
+                return False
+
+    async def autodl_login(self, headless=None):
+        """AutoDL登录"""
+        if not SELENIUM_AVAILABLE:
+            if not self._ensure_autodl_dependencies():
+                self.show_dialog('依赖缺失', '自动安装 selenium 失败，请手动安装')
+                return
+        
+        username = self.autodl_username_input.value.strip()
+        password = self.autodl_password_input.value
+        
+        headless = headless if headless is not None else (self.headless_radio.value == "headless")
+        
+        self.update_autodl_status('开始登录流程...')
+
+        def login_thread():
+            try:
+                self._login_via_list_tag(username, password, headless)
+            except Exception as e:
+                self.update_autodl_status(f'登录异常: {str(e)}')
+                print(f"登录异常: {e}")
+        
+        login_thread_obj = threading.Thread(target=login_thread)
+        login_thread_obj.daemon = True
+        login_thread_obj.start()
+
+    def _login_via_list_tag(self, username, password, headless):
+        """实际的登录逻辑"""
+        try:
+            if not self.autodl_driver:
+                if not self.init_autodl_driver(headless=headless):
+                    return
+            
+            self.update_autodl_status('正在访问AutoDL...')
+            list_url = 'https://www.autodl.com/console/instance/list'
+            
+            try:
+                self.autodl_driver.get(list_url)
+            except Exception:
+                pass
+            
+            time.sleep(1)
+            cu = ''
+            try:
+                cu = self.autodl_driver.current_url
+            except Exception:
+                cu = ''
+            
+            if 'login' in cu:
+                self.update_autodl_status('检测到登录页面，准备登录...')
+                if not password:
+                    self.update_autodl_status('请输入密码进行登录')
+                    return
+                
+                # 等待输入框
+                pw = None
+                try:
+                     WebDriverWait(self.autodl_driver, 10).until(EC.presence_of_element_located((By.XPATH, "//input[@type='password']")))
+                     pws = self.autodl_driver.find_elements(By.XPATH, "//input[@type='password']")
+                     if pws: pw = pws[0]
+                except Exception:
+                    pass
+                
+                un = None
+                try:
+                    cands = self.autodl_driver.find_elements(By.XPATH, "//input[@type='text'] | //input[@type='tel']")
+                    if cands:
+                        un = cands[-1]
+                except Exception:
+                    un = None
+                
+                if un and username:
+                    try:
+                        self.update_autodl_status('正在输入用户名...')
+                        un.clear()
+                        un.send_keys(username)
+                    except Exception:
+                        pass
+                
+                if pw and password:
+                    try:
+                        self.update_autodl_status('正在输入密码...')
+                        pw.clear()
+                        pw.send_keys(password)
+                    except Exception:
+                        pass
+                
+                # 点击登录
+                btn = None
+                for xp in [
+                    ".//button[contains(normalize-space(),'登录')]",
+                    "//button[contains(normalize-space(),'登录')]",
+                    "//*[contains(@class,'el-button--primary')]",
+                ]:
+                    try:
+                        btn = self.autodl_driver.find_element(By.XPATH, xp)
+                        break
+                    except Exception:
+                        continue
+                
+                if btn:
+                    try:
+                        self.update_autodl_status('正在点击登录按钮...')
+                        self.autodl_driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                        time.sleep(0.5)
+                        try:
+                            btn.click()
+                        except:
+                            self.autodl_driver.execute_script('arguments[0].click();', btn)
+                    except Exception:
+                        pass
+                
+                self.update_autodl_status('等待登录跳转...')
+                time.sleep(2)
+                
+                try:
+                    WebDriverWait(self.autodl_driver, 5).until(lambda d: 'login' not in d.current_url)
+                except:
+                    pass
+
+            # 最终检查
+            try:
+                self.autodl_driver.get(list_url)
+            except Exception:
+                pass
+            
+            time.sleep(1)
+            final_url = ''
+            try:
+                final_url = self.autodl_driver.current_url
+            except:
+                pass
+            
+            if 'login' in final_url:
+                self.update_autodl_status('登录失败：未能进入控制台，请检查账号密码')
+                self.update_autodl_login_status(False)
+            else:
+                try:
+                    self.autodl_driver.execute_script("document.body.style.zoom='70%'")
+                except Exception:
+                    pass
+                self.update_autodl_login_status(True)
+                self.is_autodl_logged_in = True
+                self.update_autodl_status('登录成功')
+
+        except Exception as e:
+            try:
+                self.update_autodl_status(f'登录过程出错: {str(e)}')
+            except Exception:
+                pass
+
+    def autodl_logout(self, e=None):
+        """AutoDL登出"""
+        try:
+            if self.autodl_driver:
+                self.autodl_driver.get('https://www.autodl.com/logout')
+                self.update_autodl_login_status(False)
+                self.update_autodl_status('已登出')
+                try:
+                    self.autodl_driver.quit()
+                except Exception:
+                    pass
+                self.autodl_driver = None
+        except Exception as e:
+            self.update_autodl_status(f'登出出错: {str(e)}')
+
+    def autodl_refresh_devices(self, initial=False):
+        """刷新AutoDL设备列表"""
+        if not self.autodl_driver:
+            self.update_autodl_status('浏览器未初始化')
+            return
+        try:
+            if self.autodl_busy:
+                self.update_autodl_status('正在执行任务，请稍候...')
+                return
+        except Exception:
+            pass
+            
+        try:
+            if self.refreshing:
+                self.update_autodl_status('正在刷新中，请稍候...')
+                return
+            
+            if getattr(self, 'autodl_refresh_lock', None):
+                if not self.autodl_refresh_lock.acquire(blocking=False):
+                    self.update_autodl_status('正在刷新中，请稍候...')
+                    return
+            
+            self.refreshing = True
+            self.autodl_busy = True
+        except Exception:
+            self.refreshing = True
+            self.autodl_busy = True
+
+        def refresh_thread():
+            try:
+                self.update_autodl_status('正在刷新设备列表...')
+                
+                target_url = 'https://www.autodl.com/console/instance/list'
+                current_url = self.autodl_driver.current_url
+                
+                try:
+                    if 'login' in current_url:
+                        self.update_autodl_status('检测到登录失效，正在尝试重新登录...')
+                        self.is_autodl_logged_in = False
+                        self.update_autodl_login_status(False)
+                        return 
+
+                    if target_url in current_url:
+                        self.autodl_driver.refresh()
+                    else:
+                        self.autodl_driver.get(target_url)
+                except TimeoutException:
+                     self.update_autodl_status('页面加载超时，尝试继续读取...')
+                
+                self._debug_page_state('刷新前')
+                rows, empty = self._wait_rows_or_empty(timeout=(12 if initial else 8), interval=0.2)
+                self._debug_page_state('等待后')
+
+                gpu_devices = self.autodl_detect_gpu_devices()
+                
+                if gpu_devices:
+                    rows = []
+                    for device in gpu_devices:
+                        if 'row_element' in device:
+                            rows.append(device['row_element'])
+                        elif 'container_element' in device:
+                            rows.append(device['container_element'])
+                    
+                    table_data = self._format_rows_for_table(rows)
+                    current_hash = self._compute_device_hash(table_data)
+                    self.update_device_table(table_data)
+                    if current_hash != self.last_device_hash:
+                        self.update_autodl_status(f'刷新成功，找到 {len(rows)} 台设备')
+                        self.last_device_hash = current_hash
+                    
+                    try:
+                        self.load_config_list()
+                    except Exception:
+                        pass
+                else:
+                    if empty:
+                        table_data = []
+                        current_hash = self._compute_device_hash(table_data)
+                        self.update_device_table(table_data)
+                        if current_hash != self.last_device_hash:
+                            self.update_autodl_status('列表为空')
+                            self.last_device_hash = current_hash
+                        return
+                    self.update_autodl_status('未检测到设备 (可能页面结构变更或无实例)')
+                
+            except Exception as e:
+                self.update_autodl_status(f'刷新失败: {str(e)}')
+                print(f"刷新详细错误: {e}")
+            finally:
+                try:
+                    self.refreshing = False
+                    if getattr(self, 'autodl_refresh_lock', None):
+                        if self.autodl_refresh_lock.locked():
+                            self.autodl_refresh_lock.release()
+                except Exception as e:
+                    print(f"释放锁错误: {e}")
+                    self.refreshing = False
+                try:
+                    self.autodl_busy = False
+                except Exception:
+                    pass
+                try:
+                    self.update_autodl_status('刷新任务完成')
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=refresh_thread)
+        t.daemon = True
+        t.start()
+
+    def update_device_table(self, data_list):
+        """更新设备表格"""
+        try:
+            # 清除现有行
+            while len(self.autodl_devices_table.rows) > 0:
+                self.autodl_devices_table.rows.pop()
+            
+            for data in data_list:
+                try:
+                    remark = data.get('remark', '')
+                    device_name = data.get('device_name', '未知设备')
+                    status = data.get('status', '未知状态')
+                    specs = data.get('specs', '')
+                    device_id = data.get('device_id', '')
+
+                    if device_name != '未知设备' or status != '未知状态':
+                        # 创建操作按钮
+                        if '已关机' in status or '关机' in status or 'stopped' in status.lower():
+                            start_button = ft.ElevatedButton("开机", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_start_only(dev_id, rem))
+                            smart_button = ft.ElevatedButton("开机并连接", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_start(dev_id, rem))
+                            nogpu_button = ft.ElevatedButton("无卡开机", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_start_nogpu(dev_id, rem))
+                            setup_button = ft.ElevatedButton("设置连接信息", on_click=lambda e, dev_id=device_id, rem=remark, gpu=specs, loc=device_name: self._open_device_config_dialog(dev_id, rem, gpu, loc))
+                            
+                            actions = ft.Row([start_button, smart_button, nogpu_button, setup_button], spacing=5)
+                        elif '运行中' in status or '开机' in status or 'running' in status.lower():
+                            stop_button = ft.ElevatedButton("关机", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_stop(dev_id, rem))
+                            forward_button = ft.ElevatedButton("转发", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_forward_only(dev_id, rem))
+                            connect_button = ft.ElevatedButton("启动并连接", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_connect_device(dev_id, rem))
+                            jupyter_button = ft.ElevatedButton("JupyterLab", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_click_jupyterlab(dev_id, rem))
+                            autopanel_button = ft.ElevatedButton("AutoPanel", on_click=lambda e, dev_id=device_id, rem=remark: self.autodl_click_autopanel(dev_id, rem))
+                            setup_button = ft.ElevatedButton("设置连接信息", on_click=lambda e, dev_id=device_id, rem=remark, gpu=specs, loc=device_name: self._open_device_config_dialog(dev_id, rem, gpu, loc))
+                            
+                            actions = ft.Row([stop_button, forward_button, connect_button, jupyter_button, autopanel_button, setup_button], spacing=5)
+                        else:
+                            actions = ft.Text("-")
+                        
+                        row = ft.DataRow(
+                            cells=[
+                                ft.DataCell(ft.Text(remark)),
+                                ft.DataCell(ft.Text(device_name)),
+                                ft.DataCell(ft.Text(status)),
+                                ft.DataCell(ft.Text(specs)),
+                                ft.DataCell(actions)
+                            ]
+                        )
+                        self.autodl_devices_table.rows.append(row)
+                except Exception as row_error:
+                    print(f"处理设备数据时出错: {row_error}")
+                    continue
+            
+            self.page.update()
+        except Exception as e:
+            self.update_autodl_status(f'更新设备表格失败: {str(e)}')
+
+    def _format_rows_for_table(self, rows):
+        """格式化表格行数据"""
+        data_list = []
+        try:
+            import re as _re
+            for row in rows:
+                try:
+                    device_name = '未知设备'
+                    device_id = ''
+                    remark = ''
+                    status = '未知状态'
+                    specs = ''
+                    try:
+                        cells = row.find_elements(By.TAG_NAME, 'td')
+                    except Exception:
+                        cells = []
+                    if cells:
+                        cell_text = (cells[0].text or '').strip()
+                        lines = [ln.strip() for ln in cell_text.split('\n') if ln.strip()]
+                        device_name = lines[0] if lines else '未知设备'
+                        id_line = ''
+                        for ln in lines[1:]:
+                            if _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
+                                id_line = ln
+                                break
+                        device_id = id_line
+                        for ln in lines[1:]:
+                            if '-' in ln and _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
+                                continue
+                            remark = ln
+                            break
+                        if not remark and len(lines) >= 3:
+                            remark = lines[2]
+                        status_text = (cells[1].text or '').strip() if len(cells) > 1 else '未知状态'
+                        status_lines = [ln.strip() for ln in status_text.split('\n') if ln.strip()]
+                        status_main = status_lines[0] if status_lines else '未知状态'
+                        try:
+                            pri = {'run':0,'boot':1,'stop':2,'other':3}
+                            def weight(s):
+                                sl = s.lower()
+                                if ('运行中' in s) or ('running' in sl):
+                                    return pri['run']
+                                if any(k in s for k in ['开机中','正在开机','启动中']) or any(k in sl for k in ['starting','booting']):
+                                    return pri['boot']
+                                if ('已关机' in s) or ('stopped' in sl):
+                                    return pri['stop']
+                                return pri['other']
+                            status_main = min(status_lines or ['未知状态'], key=weight)
+                        except Exception:
+                            pass
+                        gpu_line = next((ln for ln in status_lines if 'GPU' in ln), '')
+                        status = status_main + (f" · {gpu_line}" if gpu_line else '')
+                        specs = (cells[2].text or '').strip() if len(cells) > 2 else ''
+                        try:
+                            st_low = (row.text or '').lower()
+                            sp_low = specs.lower()
+                            if ((('无卡' in row.text) or ('no gpu' in st_low)) or ('无卡' in specs) or ('no gpu' in sp_low)) and (('运行中' in status_main) or ('running' in status_main.lower())):
+                                status = f"{status} · 无卡模式"
+                        except Exception:
+                            pass
+                    else:
+                        row_text = (getattr(row, 'text', '') or '').strip()
+                        if row_text:
+                            lines = [ln.strip() for ln in row_text.split('\n') if ln.strip()]
+                            device_name = lines[0] if lines else '未知设备'
+                            id_line = ''
+                            for ln in lines[1:]:
+                                if _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
+                                    id_line = ln
+                                    break
+                            device_id = id_line
+                            for ln in lines[1:]:
+                                if '-' in ln and _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
+                                    continue
+                                remark = ln
+                                break
+                            if not remark and len(lines) >= 3:
+                                remark = lines[2]
+                            status_lines = [ln for ln in lines[1:] if ln]
+                            status_main = status_lines[0] if status_lines else '未知状态'
+                            try:
+                                pri = {'run':0,'boot':1,'stop':2,'other':3}
+                                def weight2(s):
+                                    sl = s.lower()
+                                    if ('运行中' in s) or ('running' in sl):
+                                        return pri['run']
+                                    if any(k in s for k in ['开机中','正在开机','启动中']) or any(k in sl for k in ['starting','booting']):
+                                        return pri['boot']
+                                    if ('已关机' in s) or ('stopped' in sl):
+                                        return pri['stop']
+                                    return pri['other']
+                                status_main = min(status_lines or ['未知状态'], key=weight2)
+                            except Exception:
+                                pass
+                            gpu_line = next((line for line in lines if 'GPU' in line), '')
+                            status = status_main + (f" · {gpu_line}" if gpu_line else '')
+                            specs = '\n'.join(lines[2:]) if len(lines) > 2 else specs
+                            try:
+                                rt_low = row_text.lower()
+                                sp_low = specs.lower()
+                                if ((('无卡' in row_text) or ('no gpu' in rt_low)) or ('无卡' in specs) or ('no gpu' in sp_low)) and (('运行中' in status_main) or ('running' in status_main.lower())):
+                                    status = f"{status} · 无卡模式"
+                            except Exception:
+                                pass
+                    data_list.append({'remark': remark, 'device_name': device_name, 'status': status, 'specs': specs, 'device_id': device_id})
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return data_list
+
+    def _compute_device_hash(self, table_data):
+        """计算设备数据哈希值"""
+        try:
+            pairs = []
+            for d in table_data or []:
+                id_ = (d.get('device_id') or d.get('device_name') or '').strip()
+                st = (d.get('status') or '').strip()
+                pairs.append(f"{id_}|{st}")
+            pairs.sort()
+            return '|#|'.join(pairs)
+        except Exception:
+            try:
+                return str(len(table_data or []))
+            except Exception:
+                return '0'
+
+    def _wait_rows_or_empty(self, timeout=8, interval=0.2):
+        """等待行数据"""
+        rows = []
+        empty = False
+        import time as _t
+        start = _t.time()
+        while _t.time() - start < timeout:
+            try:
+                rows = self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-table__body tr')
+                if rows:
+                    break
+                empties = self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-table__empty-text')
+                loading_masks = self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-loading-mask')
+                if empties:
+                    if not loading_masks:
+                        empty = True
+                        break
+            except Exception:
+                pass
+            _t.sleep(interval)
+        return rows, empty
+
+    def _debug_page_state(self, label=''):
+        """调试页面状态"""
+        try:
+            cu = ''
+            rs = ''
+            rows_cnt = 0
+            empty_cnt = 0
+            loading_cnt = 0
+            try:
+                cu = self.autodl_driver.current_url
+            except Exception:
+                pass
+            try:
+                rs = self.autodl_driver.execute_script('return document.readyState')
+            except Exception:
+                pass
+            try:
+                rows_cnt = len(self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-table__body tr'))
+            except Exception:
+                rows_cnt = 0
+            try:
+                empty_cnt = len(self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-table__empty-text'))
+            except Exception:
+                empty_cnt = 0
+            try:
+                loading_cnt = len(self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-loading-mask'))
+            except Exception:
+                loading_cnt = 0
+            print(f"[AutoDL][DEBUG] {label} url={cu} readyState={rs} rows={rows_cnt} emptyHints={empty_cnt} loadingMasks={loading_cnt}")
+        except Exception:
+            pass
+
+    def _cleanup_chrome_profile(self, profile_dir):
+        """清理Chrome配置文件"""
+        try:
+            for name in ['SingletonLock', 'SingletonCookie', 'SingletonSharedMemory', 'SingletonSocket']:
+                p = os.path.join(profile_dir, name)
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def autodl_detect_gpu_devices(self):
+        """检测GPU设备"""
+        if not self.autodl_driver:
+            return []
+
+        devices = []
+        try:
+            try:
+                self.autodl_driver.execute_script("document.body.style.zoom='60%'")
+                time.sleep(0.5)
+            except:
+                pass
+
+            rows = self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-table__body tr')
+            
+            if not rows:
+                rows = self.autodl_driver.find_elements(By.TAG_NAME, 'tr')
+                if len(rows) > 0 and 'th' in rows[0].get_attribute('innerHTML').lower():
+                    rows = rows[1:]
+
+            for i, row in enumerate(rows):
+                try:
+                    if not row.is_displayed():
+                        continue
+
+                    text_content = row.text
+                    is_valid_row = False
+                    
+                    import re
+                    if re.search(r'[a-f0-9]{4,}', text_content.lower()):
+                        is_valid_row = True
+                    elif any(k in text_content for k in ['运行中', '关机', '开机', 'GPU', '¥']):
+                        is_valid_row = True
+
+                    if is_valid_row:
+                        cells = row.find_elements(By.TAG_NAME, 'td')
+                        cell_texts = [c.text.strip() for c in cells]
+                        
+                        devices.append({
+                            'row_element': row,
+                            'data': cell_texts,
+                            'text': text_content
+                        })
+                except StaleElementReferenceException:
+                    print(f"行 {i} 元素已失效 (Stale)")
+                    continue
+                except Exception as e:
+                    print(f"解析行 {i} 出错: {e}")
+                    continue
+
+            return devices
+
+        except Exception as e:
+            print(f"GPU 检测严重错误: {e}")
+            return []
+
+    # 以下方法保持原功能，但适配Flet UI
+    def autodl_start(self, device_id=None, remark=None):
+        """启动设备"""
+        if self.autodl_busy:
+            self.update_autodl_status('正在执行任务，请稍候...')
+            return
+        
+        def start_thread():
+            try:
+                self.update_autodl_status(f'正在启动设备: {remark or device_id}')
+                row = self._find_row_by_device_id(device_id) if device_id else self._find_row_by_remark(remark)
+                
+                # 尝试查找开机按钮
+                btn = None
+                try:
+                    btn = row.find_element(By.XPATH, ".//span[contains(text(), '开机')]")
+                except:
+                    try:
+                        btn = row.find_element(By.XPATH, ".//*[contains(text(), '开机')]")
+                    except:
+                        pass
+                
+                if not btn:
+                     self.update_autodl_status('未找到开机按钮，可能设备已开机或状态不正确')
+                     return
+
+                self.autodl_driver.execute_script("arguments[0].click();", btn)
+                time.sleep(1)
+                
+                # 确认对话框 (有时开机需要确认，有时不需要，视具体情况而定，这里尝试处理)
+                try:
+                    confirm = WebDriverWait(self.autodl_driver, 3).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., '确定')]")))
+                    confirm.click()
+                except:
+                    pass
+                
+                self.update_autodl_status('开机指令已发送，请等待设备启动...')
+                
+            except Exception as e:
+                self.update_autodl_status(f'启动失败: {str(e)}')
+            finally:
+                self.autodl_busy = False
+        
+        self.autodl_busy = True
+        t = threading.Thread(target=start_thread)
+        t.daemon = True
+        t.start()
+
+    def autodl_stop(self, device_id=None, remark=None):
+        """停止设备"""
+        if self.autodl_busy:
+            self.update_autodl_status('正在执行任务，请稍候...')
+            return
+        
+        def stop_thread():
+            try:
+                self.update_autodl_status(f'正在停止设备: {remark or device_id}')
+                row = self._find_row_by_device_id(device_id) if device_id else self._find_row_by_remark(remark)
+                
+                # 尝试查找关机按钮
+                btn = None
+                try:
+                    # 可能是直接的关机按钮，或者是"更多"里面的
+                    btn = row.find_element(By.XPATH, ".//*[contains(text(), '关机')]")
+                except:
+                    # 尝试点击"更多"
+                    try:
+                        more = row.find_element(By.XPATH, ".//*[contains(text(), '更多')]")
+                        self.autodl_driver.execute_script("arguments[0].click();", more)
+                        time.sleep(0.5)
+                        # 在下拉菜单中找关机
+                        btn = self.autodl_driver.find_element(By.XPATH, "//li[contains(text(), '关机')]")
+                    except:
+                        pass
+                
+                if not btn:
+                     self.update_autodl_status('未找到关机按钮')
+                     return
+
+                self.autodl_driver.execute_script("arguments[0].click();", btn)
+                time.sleep(1)
+                
+                # 确认对话框
+                try:
+                    confirm = WebDriverWait(self.autodl_driver, 5).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., '确定')]")))
+                    confirm.click()
+                except:
+                    pass
+                
+                self.update_autodl_status('关机指令已发送')
+                
+            except Exception as e:
+                self.update_autodl_status(f'停止失败: {str(e)}')
+            finally:
+                self.autodl_busy = False
+        
+        self.autodl_busy = True
+        t = threading.Thread(target=stop_thread)
+        t.daemon = True
+        t.start()
+
+    def autodl_start_only(self, device_id=None, remark=None):
+        """仅启动设备"""
+        self.autodl_start(device_id, remark)
+
+    def _get_clipboard_text_windows(self):
+        """获取剪贴板文本 (Windows)"""
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            
+            if not user32.OpenClipboard(None):
+                return ""
+                
+            h_clip_mem = user32.GetClipboardData(13) # CF_UNICODETEXT
+            if not h_clip_mem:
+                user32.CloseClipboard()
+                return ""
+                
+            p_clip_mem = kernel32.GlobalLock(h_clip_mem)
+            text = ctypes.c_wchar_p(p_clip_mem).value
+            kernel32.GlobalUnlock(h_clip_mem)
+            user32.CloseClipboard()
+            return text
+        except Exception:
+            return ""
+
+    def autodl_forward_only(self, device_id=None, remark=None):
+        """仅转发 (一键连接)"""
+        if self.autodl_busy:
+            self.update_autodl_status('正在执行任务，请稍候...')
+            return
+        
+        def forward_thread():
+            try:
+                self.update_autodl_status(f'正在获取连接信息: {remark or device_id}')
+                row = self._find_row_by_device_id(device_id) if device_id else self._find_row_by_remark(remark)
+                
+                # 查找 "复制登录指令"
+                btn = None
+                try:
+                    btn = row.find_element(By.XPATH, ".//*[contains(text(), '复制登录指令')]")
+                except:
+                     try:
+                         more = row.find_element(By.XPATH, ".//*[contains(text(), '更多')]")
+                         self.autodl_driver.execute_script("arguments[0].click();", more)
+                         time.sleep(0.5)
+                         btn = self.autodl_driver.find_element(By.XPATH, "//li[contains(text(), '复制登录指令')]")
+                     except:
+                         pass
+                
+                if not btn:
+                    self.update_autodl_status('未找到复制登录指令按钮')
+                    return
+
+                self.autodl_driver.execute_script("arguments[0].click();", btn)
+                time.sleep(1)
+                
+                # 读取剪贴板
+                ssh_cmd = self._get_clipboard_text_windows()
+                if not ssh_cmd or 'ssh' not in ssh_cmd:
+                    self.update_autodl_status('未能获取有效的SSH指令')
+                    return
+                
+                self.update_autodl_status(f'获取指令成功: {ssh_cmd[:20]}...')
+                
+                # 解析 ssh -p <port> <user>@<host>
+                match = re.search(r'ssh\s+-p\s+(\d+)\s+(\w+)@([\w\.-]+)', ssh_cmd)
+                if not match:
+                    self.update_autodl_status('SSH指令格式解析失败')
+                    return
+                
+                port = match.group(1)
+                user = match.group(2)
+                host = match.group(3)
+                
+                # 更新UI
+                self.ssh_info_input.value = f"ssh -p {port} {user}@{host}"
+                if not self.remote_port_input.value:
+                    self.remote_port_input.value = "6006"
+                
+                self.page.update()
+                
+                # 触发连接
+                self.update_autodl_status('正在建立连接...')
+                if self.is_connected:
+                    self.disconnect(None)
+                    time.sleep(1)
+                
+                self.toggle_connection(None)
+                
+            except Exception as e:
+                self.update_autodl_status(f'连接操作失败: {str(e)}')
+            finally:
+                self.autodl_busy = False
+        
+        self.autodl_busy = True
+        t = threading.Thread(target=forward_thread)
+        t.daemon = True
+        t.start()
+
+    def autodl_start_nogpu(self, device_id=None, remark=None):
+        """无卡启动"""
+        self.autodl_start(device_id, remark)
+
+    def autodl_connect_device(self, device_id=None, remark=None):
+        """连接设备"""
+        self.autodl_forward_only(device_id, remark)
+
+    def autodl_click_jupyterlab(self, device_id=None, remark=None):
+        """点击JupyterLab"""
+        def action_thread():
+            try:
+                row = self._find_row_by_device_id(device_id) if device_id else self._find_row_by_remark(remark)
+                btn = row.find_element(By.XPATH, ".//*[contains(text(), 'JupyterLab')]")
+                self.autodl_driver.execute_script("arguments[0].click();", btn)
+                self.update_autodl_status('已点击 JupyterLab')
+            except Exception as e:
+                self.update_autodl_status(f'点击JupyterLab失败: {str(e)}')
+        threading.Thread(target=action_thread, daemon=True).start()
+
+    def autodl_click_autopanel(self, device_id=None, remark=None):
+        """点击AutoPanel"""
+        def action_thread():
+            try:
+                row = self._find_row_by_device_id(device_id) if device_id else self._find_row_by_remark(remark)
+                btn = row.find_element(By.XPATH, ".//*[contains(text(), 'AutoPanel')]")
+                self.autodl_driver.execute_script("arguments[0].click();", btn)
+                self.update_autodl_status('已点击 AutoPanel')
+            except Exception as e:
+                self.update_autodl_status(f'点击AutoPanel失败: {str(e)}')
+        threading.Thread(target=action_thread, daemon=True).start()
+
+    def _goto_instance_list(self):
+        """跳转到实例列表"""
+        target_url = 'https://www.autodl.com/console/instance/list'
+        try:
+            cu = self.autodl_driver.current_url
+        except Exception:
+            cu = ''
+        if '/console/instance/list' not in cu:
+            try:
+                self.autodl_driver.get(target_url)
+            except Exception:
+                pass
+        try:
+            WebDriverWait(self.autodl_driver, 4).until(lambda d: d.find_elements(By.CSS_SELECTOR, '.el-table__body tr') or d.find_elements(By.CSS_SELECTOR, '.el-table__empty-text'))
+        except Exception:
+            try:
+                WebDriverWait(self.autodl_driver, 4).until(EC.presence_of_element_located((By.TAG_NAME, 'table')))
+            except Exception:
+                pass
+        try:
+            self.autodl_driver.execute_script("document.body.style.zoom='70%'")
+        except Exception:
+            pass
+        return True
+
+    def _find_row_by_device_id(self, device_id):
+        """根据设备ID查找行 (改进版)"""
+        # 1. 尝试通过文本直接查找 (精确匹配)
+        # 查找所有行
+        rows = self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-table__body tr')
+        if not rows:
+             rows = self.autodl_driver.find_elements(By.TAG_NAME, 'tr')
+        
+        for row in rows:
+            if not row.is_displayed():
+                continue
+            try:
+                if device_id in row.text:
+                    return row
+            except:
+                continue
+        
+        # 2. 如果找不到，尝试等待元素出现 (针对动态加载)
+        xpath = f"//*[contains(text(), '{device_id}')]"
+        try:
+            el = WebDriverWait(self.autodl_driver, 5).until(EC.presence_of_element_located((By.XPATH, xpath)))
+            # 向上查找 tr
+            return el.find_element(By.XPATH, "./ancestor::tr[1]")
+        except:
+            raise NoSuchElementException(f'未找到设备ID为 {device_id} 的行')
+
+    def _find_row_by_remark(self, remark_text):
+        """根据备注查找行 (改进版)"""
+        rows = self.autodl_driver.find_elements(By.CSS_SELECTOR, '.el-table__body tr')
+        if not rows:
+             rows = self.autodl_driver.find_elements(By.TAG_NAME, 'tr')
+        
+        for row in rows:
+            if not row.is_displayed():
+                continue
+            try:
+                if remark_text in row.text:
+                    return row
+            except:
+                continue
+                
+        xpath = f"//*[contains(text(), '{remark_text}')]"
+        try:
+            el = WebDriverWait(self.autodl_driver, 5).until(EC.presence_of_element_located((By.XPATH, xpath)))
+            return el.find_element(By.XPATH, "./ancestor::tr[1]")
+        except:
+            raise NoSuchElementException(f'未找到备注为 {remark_text} 的行')
+
+    def _is_stopped_row(self, r):
+        """检查行是否停止"""
+        try:
+            tds = r.find_elements(By.TAG_NAME, 'td')
+            st = tds[1].text if len(tds) >= 2 else r.text
+            sl = st.lower()
+            if ('已关机' in st) or ('stopped' in sl):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _load_device_map(self):
+        """加载设备映射"""
+        try:
+            if self.device_map_file and os.path.exists(self.device_map_file):
+                with open(self.device_map_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_device_map(self, m):
+        """保存设备映射"""
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+            with open(self.device_map_file, 'w', encoding='utf-8') as f:
+                json.dump(m, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _sanitize_name(self, s):
+        """清理名称"""
+        try:
+            base = (s or '').strip()
+            if not base:
+                return ''
+            import re as _re
+            base = _re.sub(r"[^\w\-\_\u4e00-\u9fa5]", '_', base)
+            base = _re.sub(r"_+", '_', base)
+            return base[:64]
+        except Exception:
+            return s or ''
+
+    def _ensure_device_config(self, remark, device_id):
+        """确保设备配置"""
+        try:
+            m = self._load_device_map()
+            safe_remark = self._sanitize_name(remark) or (device_id[-6:] if device_id else '设备')
+            cfg_name = m.get(device_id)
+            if not cfg_name:
+                cfg_name = safe_remark
+                cfg_path = os.path.join(self.config_dir, f'{cfg_name}.json')
+                if os.path.exists(cfg_path):
+                    try:
+                        with open(cfg_path, 'r', encoding='utf-8') as f:
+                            existing = json.load(f)
+                        if existing.get('device_id') and existing.get('device_id') != device_id:
+                            cfg_name = f"{safe_remark}-{(device_id or '')[-6:]}"
+                            cfg_path = os.path.join(self.config_dir, f'{cfg_name}.json')
+                    except Exception:
+                        cfg_name = f"{safe_remark}-{(device_id or '')[-6:]}"
+                        cfg_path = os.path.join(self.config_dir, f'{cfg_name}.json')
+                data = {
+                    'ssh_info': '',
+                    'remote_port': '',
+                    'password': '',
+                    'auto_open_browser': True,
+                    'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'device_id': device_id or '',
+                    'remark': remark or safe_remark,
+                }
+                os.makedirs(self.config_dir, exist_ok=True)
+                with open(cfg_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                m[device_id] = cfg_name
+                self._save_device_map(m)
+            return True
+        except Exception:
+            return False
+
+    def _connect_using_device_config(self, device_id):
+        """使用设备配置连接"""
+        try:
+            m = self._load_device_map()
+            cfg_name = m.get(device_id)
+            if not cfg_name:
+                self.update_status('未找到该设备的配置，请在左侧填写并保存')
+                return False
+            cfg_path = os.path.join(self.config_dir, f'{cfg_name}.json')
+            if not os.path.exists(cfg_path):
+                self.update_status('配置文件不存在，请重新保存')
+                return False
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            ssh_info = str(data.get('ssh_info', '')).strip()
+            remote_port = str(data.get('remote_port', '')).strip()
+            password = str(data.get('password', '')).strip()
+            if not ssh_info or not remote_port or not password:
+                self.update_status('配置未填写完整（SSH、端口、密码），请在左侧补全')
+                return False
+            self.ssh_info_input.value = ssh_info
+            self.remote_port_input.value = remote_port
+            self.password_input.value = password
+            self.auto_open_browser_checkbox.value = bool(data.get('auto_open_browser', True))
+            self.connect()
+            return True
+        except Exception as e:
+            self.update_status(f'加载设备配置失败: {str(e)}')
+            return False
+
+    def _open_device_config_dialog(self, device_id, remark, gpu_specs, location_name):
+        """打开设备配置对话框"""
+        try:
+            m = self._load_device_map()
+            cfg_name = m.get(device_id)
+            existing = None
+            if cfg_name:
+                cfg_path = os.path.join(self.config_dir, f'{cfg_name}.json')
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, 'r', encoding='utf-8') as f:
+                        existing = json.load(f)
+            display_name = f"{remark}-{gpu_specs}-{location_name}".strip()
+            display_name = self._sanitize_name(display_name)
+            
+            def on_save(dialog_result):
+                if not dialog_result:
+                    return
+                
+                ssh_info, remote_port, password = dialog_result
+                if not ssh_info or not remote_port or not password:
+                    self.show_dialog('不完整', '请填写SSH、端口与密码')
+                    return
+                
+                cfg_base = display_name or (remark or (device_id[-6:] if device_id else '设备'))
+                final_name = cfg_name if cfg_name else f"{cfg_base}-{(device_id or '')[-6:]}"
+                final_name = self._sanitize_name(final_name)
+                cfg_path = os.path.join(self.config_dir, f'{final_name}.json')
+                data = {
+                    'ssh_info': ssh_info,
+                    'remote_port': remote_port,
+                    'password': password,
+                    'auto_open_browser': True,
+                    'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'device_id': device_id or '',
+                    'remark': display_name,
+                }
+                os.makedirs(self.config_dir, exist_ok=True)
+                with open(cfg_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                mm = self._load_device_map()
+                mm[device_id] = final_name
+                self._save_device_map(mm)
+                self.load_config_list()
+                self.show_dialog('已保存', '连接信息已保存到配置库')
+            
+            # 显示输入对话框
+            self.show_config_dialog(display_name, existing, on_save)
+            
+        except Exception as e:
+            self.update_status(f'设置连接信息失败: {str(e)}')
+
+    def start_refresh_timer(self):
+        """启动刷新定时器"""
+        import asyncio
+        
+        async def refresh_timer():
+            while True:
+                try:
+                    if self.is_autodl_logged_in and not self.refreshing and not self.port_forwarding_setup:
+                        if hasattr(self, 'silent_refresh_checkbox') and self.silent_refresh_checkbox.value:
+                            self.autodl_refresh_devices_quick(True)
+                        else:
+                            self.autodl_refresh_devices_quick(False)
+                except Exception:
+                    pass
+                await asyncio.sleep(30)  # 30秒刷新一次
+        
+        asyncio.create_task(refresh_timer())
+
+    def autodl_refresh_devices_quick(self, silent=False):
+        """快速刷新设备"""
+        if not self.autodl_driver or not self.is_autodl_logged_in:
+            if not silent:
+                self.update_autodl_status('请先登录AutoDL')
+            return
+        
+        if self.refreshing:
+            if not silent:
+                self.update_autodl_status('正在刷新中，请稍候')
+            return
+        
+        self.refreshing = True
+        
+        def refresh_thread():
+            try:
+                if not silent:
+                    self.update_autodl_status('正在刷新设备列表...')
+                
+                target_url = 'https://www.autodl.com/console/instance/list'
+                try:
+                    cu = self.autodl_driver.current_url
+                except Exception:
+                    cu = ''
+                if '/console/instance/list' not in cu:
+                    try:
+                        self.autodl_driver.get(target_url)
+                    except Exception:
+                        pass
+                
+                self._debug_page_state('快速刷新前')
+                rows, empty = self._wait_rows_or_empty(timeout=8, interval=0.2)
+                self._debug_page_state('快速刷新等待后')
+                
+                table_data = self._format_rows_for_table(rows)
+                current_hash = self._compute_device_hash(table_data)
+                self.update_device_table(table_data)
+                
+                if not silent and current_hash != self.last_device_hash:
+                    self.update_autodl_status(f'设备列表刷新完成，共找到 {len(rows)} 台设备')
+                    self.last_device_hash = current_hash
+                elif silent:
+                    try:
+                        self.last_auto_refresh_time = time.time()
+                        self.update_autodl_status('已自动刷新')
+                    except Exception:
+                        pass
+                
+                try:
+                    self.load_config_list()
+                except Exception:
+                    pass
+                    
+            except Exception as e:
+                if not silent:
+                    self.update_autodl_status(f'刷新设备列表失败: {str(e)}')
+            finally:
+                self.refreshing = False
+        
+        t = threading.Thread(target=refresh_thread)
+        t.daemon = True
+        t.start()
+
+    # UI工具方法
+    def show_dialog(self, title, message):
+        """显示对话框"""
+        def close_dialog(e):
+            self.page.dialog.open = False
+            self.page.update()
+        
+        dlg = ft.AlertDialog(
+            title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[ft.TextButton("确定", on_click=close_dialog)],
+        )
+        self.page.dialog = dlg
+        dlg.open = True
+        self.page.update()
+
+    def show_confirm_dialog(self, title, message, on_confirm):
+        """显示确认对话框"""
+        def on_yes(e):
+            self.page.dialog.open = False
+            self.page.update()
+            on_confirm("是")
+        
+        def on_no(e):
+            self.page.dialog.open = False
+            self.page.update()
+            on_confirm("否")
+        
+        dlg = ft.AlertDialog(
+            title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[
+                ft.TextButton("是", on_click=on_yes),
+                ft.TextButton("否", on_click=on_no),
+            ],
+        )
+        self.page.dialog = dlg
+        dlg.open = True
+        self.page.update()
+
+    def show_input_dialog(self, title, hint_text, on_save):
+        """显示输入对话框"""
+        input_field = ft.TextField(hint_text=hint_text, autofocus=True)
+        
+        def on_submit(e):
+            self.page.dialog.open = False
+            self.page.update()
+            on_save(input_field.value)
+        
+        def on_cancel(e):
+            self.page.dialog.open = False
+            self.page.update()
+            on_save(None)
+        
+        dlg = ft.AlertDialog(
+            title=ft.Text(title),
+            content=input_field,
+            actions=[
+                ft.TextButton("确定", on_click=on_submit),
+                ft.TextButton("取消", on_click=on_cancel),
+            ],
+        )
+        self.page.dialog = dlg
+        dlg.open = True
+        self.page.update()
+
+    def show_config_dialog(self, display_name, existing_data, on_save):
+        """显示配置对话框"""
+        ssh_field = ft.TextField(label="SSH连接", value=existing_data.get('ssh_info', '') if existing_data else '')
+        port_field = ft.TextField(label="远程端口", value=existing_data.get('remote_port', '') if existing_data else '')
+        password_field = ft.TextField(label="密码", password=True, can_reveal_password=True, value=existing_data.get('password', '') if existing_data else '')
+        
+        def on_submit(e):
+            self.page.dialog.open = False
+            self.page.update()
+            on_save((ssh_field.value, port_field.value, password_field.value))
+        
+        def on_cancel(e):
+            self.page.dialog.open = False
+            self.page.update()
+            on_save(None)
+        
+        dlg = ft.AlertDialog(
+            title=ft.Text("设置连接信息"),
+            content=ft.Column([
+                ft.Text(f"显示名称: {display_name}"),
+                ssh_field,
+                port_field,
+                password_field,
+            ], tight=True),
+            actions=[
+                ft.TextButton("保存", on_click=on_submit),
+                ft.TextButton("取消", on_click=on_cancel),
+            ],
+        )
+        self.page.dialog = dlg
+        dlg.open = True
+        self.page.update()
+
+    def _ensure_autodl_dependencies(self):
+        """确保AutoDL依赖"""
+        try:
+            global SELENIUM_AVAILABLE
+            if SELENIUM_AVAILABLE:
+                return True
+            
+            if is_frozen():
+                self.update_autodl_status('打包环境下无法安装AutoDL依赖，请确保构建时已包含。')
+                return False
+            
+            self.update_autodl_status('正在安装 AutoDL 依赖: selenium, webdriver-manager')
+            ok = _pip_install(['selenium>=4.0.0', 'webdriver-manager>=3.0.0'])
+            if not ok:
+                return False
+            
+            from selenium import webdriver
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            from selenium.webdriver.chrome.options import Options
+            from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException, ElementClickInterceptedException
+            from selenium.webdriver.common.action_chains import ActionChains
+            from selenium.webdriver.chrome.service import Service
+            from webdriver_manager.chrome import ChromeDriverManager
+            SELENIUM_AVAILABLE = True
+            self.update_autodl_status('依赖安装完成，可使用 AutoDL 功能')
+            return True
+        except Exception as e:
+            try:
+                self.update_autodl_status(f'依赖安装或导入失败: {str(e)}')
+            except Exception:
+                pass
+            return False
+
+    def graceful_shutdown(self):
+        """优雅关闭"""
+        try:
+            # 断开SSH连接
+            if self.is_connected:
+                self.disconnect()
+            
+            # 关闭浏览器驱动
+            if self.autodl_driver:
+                try:
+                    self.autodl_driver.quit()
+                except Exception:
+                    pass
+                self.autodl_driver = None
+            
+            # 清理资源
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
+
+async def main(page: ft.Page):
+    """主函数"""
+    # 设置页面
+    page.title = "AutoDL 一键连接"
+    page.window.width = 1200
+    page.window.height = 900
+    page.window.min_width = 1000
+    page.window.min_height = 800
+    
+    # 创建应用实例
+    app = SSHPortForwarder(page)
+    
+    # 页面关闭时优雅退出
+    def on_window_event(e):
+        if e.data == "close":
+            app.graceful_shutdown()
+    
+    page.on_window_event = on_window_event
+
+
+if __name__ == "__main__":
+    ft.app(target=main)

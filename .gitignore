@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec
+
+# PyInstaller 构建产物
+autodl启动器/dist/
+autodl启动器/build/
+autodl启动器/*.spec
+
+# 运行时配置（全部自动生成）
+autodl启动器/configs/
+autodl_configs/
+
+# ChromeDriver 缓存
+autodl启动器/.wdm/
+
+# 历史版本和打包版本（太大）
+历史版本/
+可用打包版本/
+
+# IDE
+.trae/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 杂项
+New Session.md
+/*.exe
+jupyterlab_opened.png
+autodl启动器/test_output.log
+项目的灵魂/

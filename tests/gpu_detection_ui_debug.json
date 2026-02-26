@@ -1,0 +1,20 @@
+{
+  "count": 6,
+  "devices": [
+    {
+      "table_type": "el-table",
+      "table_index": 0,
+      "row_index": 0,
+      "data": [
+        "西北B区 / 818机\n2c4c4f89b3-91324cab\ncomfyui-3",
+        "已关机\nGPU充足",
+        "vGPU-32GB * 1卡\n查看详情",
+        "系统盘 40.27%\n数据盘 60.63%",
+        "正常",
+        "按量计费",
+        "14天23小时58分后释放\n设置定时关机",
+        "",
+        "",
+        "开机 更多"
+      ],
+      "row_element": 

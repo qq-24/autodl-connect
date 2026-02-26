@@ -1,0 +1,26 @@
+{
+  "西北区 / 818机": {
+    "device_id": "2c4a4b893-a91324cab",
+    "name": "comfyiu",
+    "region": "西北区",
+    "machine": "818机"
+  },
+  "西北区 / 456机": {
+    "device_id": "c5034a8008-f30b146", 
+    "name": "lora房",
+    "region": "西北区",
+    "machine": "456机"
+  },
+  "北京六区 / 342机": {
+    "device_id": "4fce119e52-44881beb",
+    "name": "comfyiu房", 
+    "region": "北京六区",
+    "machine": "342机"
+  },
+  "西南区 / 530机": {
+    "device_id": "e47a4e8053-0e76bf4d",
+    "name": "lora房",
+    "region": "西南区", 
+    "machine": "530机"
+  }
+}

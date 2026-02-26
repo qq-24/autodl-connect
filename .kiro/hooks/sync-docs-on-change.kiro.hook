@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "name": "源码变更同步文档",
+  "description": "当 Python 源代码、配置文件或构建脚本发生变更时，自动让 agent 检查并更新 README 或 docs 目录中的相关文档，保持文档与代码同步。",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "*.py",
+      "*.json",
+      "*.spec",
+      "*.txt",
+      "*.md"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "源代码文件刚刚被修改。请检查这次变更是否影响了以下内容，并在需要时进行更新：\n1. 项目公开文档（README.md 或 docs/ 目录下的文件）\n2. 工作区 steering 文件（.kiro/steering/ 目录下的 .md 文件），包括 product.md（产品功能描述）、structure.md（项目结构）、tech.md（技术栈与构建方式）等\n\n如果变更涉及功能新增、接口变化、配置变更、依赖更新、项目结构调整或使用方式变化，请相应地更新文档和 steering 以保持同步。如果变更仅是内部重构或 bug 修复且不影响用户可见行为和项目结构，则无需更新。"
+  }
+}

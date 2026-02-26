@@ -1,0 +1,5 @@
+flet>=0.21.0
+paramiko>=2.7.0
+selenium>=4.0.0
+webdriver_manager>=3.8.0
+pyperclip>=1.8.0
