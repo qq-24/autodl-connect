@@ -180,15 +180,54 @@ except ImportError:
     else:
         pyperclip = None
 
+
+def _open_url_and_focus(url):
+    """打开 URL 并尝试将浏览器窗口切换到前台"""
+    try:
+        webbrowser.open(url)
+        # Windows: 用 Alt 键技巧绕过前台窗口限制，激活最近打开的窗口
+        time.sleep(0.5)
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            # 模拟按下 Alt 键，允许 SetForegroundWindow
+            user32.keybd_event(0x12, 0, 0, 0)  # Alt down
+            user32.keybd_event(0x12, 0, 2, 0)  # Alt up
+            hwnd = user32.GetForegroundWindow()
+            if hwnd:
+                user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 # 信号模拟类
 class Signal:
-    def __init__(self, callback=None):
+    def __init__(self, callback=None, page=None):
         self.callback = callback
+        self.page = page
     def connect(self, callback):
         self.callback = callback
     def emit(self, *args):
         if self.callback:
-            self.callback(*args)
+            if self.page and threading.current_thread() is not threading.main_thread():
+                # 非主线程：通过 page 调度到主线程
+                cb = self.callback
+                def _run():
+                    try:
+                        cb(*args)
+                    except Exception:
+                        pass
+                try:
+                    self.page.run_thread_safe(_run)
+                except Exception:
+                    # fallback: 直接调用（Flet 版本不支持 run_thread_safe 时）
+                    self.callback(*args)
+            else:
+                # 主线程或无 page：直接执行，无额外开销
+                self.callback(*args)
 
 class FletSSHPortForwarder:
     def __init__(self, page: ft.Page):
@@ -230,7 +269,8 @@ class FletSSHPortForwarder:
         self.refreshing = False
         self.port_forwarding_setup = False
         self.autodl_refresh_lock = threading.Lock()
-        self.autodl_busy = False
+        self.selenium_lock = threading.Lock()  # 替代 autodl_busy，保护 Selenium driver 并发访问
+        self.autodl_busy = False  # 保留向后兼容，读取时优先用 selenium_lock.locked()
         self._renew_cancel = False
         self.last_auto_refresh_time = 0
         
@@ -267,11 +307,11 @@ class FletSSHPortForwarder:
         self.readme_path = self._ensure_readme_file()
         
         # 信号
-        self.update_status_signal = Signal()
-        self.connection_status_signal = Signal()
-        self.autodl_status_signal = Signal()
-        self.autodl_login_signal = Signal()
-        self.update_device_table_signal = Signal()
+        self.update_status_signal = Signal(page=self.page)
+        self.connection_status_signal = Signal(page=self.page)
+        self.autodl_status_signal = Signal(page=self.page)
+        self.autodl_login_signal = Signal(page=self.page)
+        self.update_device_table_signal = Signal(page=self.page)
         
         # 窗口位置记忆文件
         self.window_settings_file = os.path.join(self.config_dir, 'window_settings.json')
@@ -378,35 +418,71 @@ class FletSSHPortForwarder:
         return None
 
     def _ensure_readme_file(self):
+        """生成 HTML 格式的使用说明文件"""
         try:
-            target = os.path.join(self.portable_base_dir, 'README.md')
-            if os.path.exists(target):
-                return target
-            
-            def copy_readme_async():
-                try:
-                    src = self._get_readme_source_path()
-                    if src and os.path.exists(src):
-                        import shutil
-                        try:
-                            shutil.copyfile(src, target)
-                        except Exception:
-                            pass
-                    if not os.path.exists(target):
-                        try:
-                            with open(target, 'w', encoding='utf-8') as f:
-                                f.write('AutoDL 一键连接使用说明\n\n- 在左侧填写 SSH 信息与端口后保存配置\n- 点击连接按钮建立端口转发\n- 问号按钮打开本说明文件\n')
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            
-            t = threading.Thread(target=copy_readme_async, daemon=True)
-            t.start()
-            
+            target = os.path.join(self.portable_base_dir, 'help.html')
+            html = '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AutoDL 一键连接 - 使用说明</title>
+<style>
+body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #1a1a2e; color: #e0e0e0; line-height: 1.8; }
+h1 { color: #64b5f6; border-bottom: 2px solid #333; padding-bottom: 10px; }
+h2 { color: #81c784; margin-top: 30px; }
+code { background: #2d2d44; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+.step { background: #2d2d44; border-left: 3px solid #64b5f6; padding: 12px 16px; margin: 10px 0; border-radius: 0 6px 6px 0; }
+.step b { color: #64b5f6; }
+.tip { background: #2d3a2d; border-left: 3px solid #81c784; padding: 12px 16px; margin: 10px 0; border-radius: 0 6px 6px 0; }
+.warn { background: #3a2d2d; border-left: 3px solid #ef9a9a; padding: 12px 16px; margin: 10px 0; border-radius: 0 6px 6px 0; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+th, td { border: 1px solid #444; padding: 8px 12px; text-align: left; }
+th { background: #2d2d44; color: #64b5f6; }
+kbd { background: #444; padding: 2px 6px; border-radius: 3px; border: 1px solid #666; font-size: 0.85em; }
+</style>
+</head>
+<body>
+<h1>AutoDL 一键连接 使用说明</h1>
+
+<h2>快速开始</h2>
+<div class="step"><b>1.</b> 输入 AutoDL 账号密码，点击「登录」</div>
+<div class="step"><b>2.</b> 登录成功后设备列表自动加载</div>
+<div class="step"><b>3.</b> 选择设备，点击「开机」等待就绪</div>
+<div class="step"><b>4.</b> 在右侧填写 SSH 信息（或从设备绑定自动填入）</div>
+<div class="step"><b>5.</b> 点击「连接」建立 SSH 隧道和端口转发</div>
+<div class="step"><b>6.</b> 点击「Jupyter」或「Panel」快捷打开服务</div>
+
+<h2>设备管理</h2>
+<table>
+<tr><th>操作</th><th>说明</th></tr>
+<tr><td>刷新</td><td>重新从 AutoDL 抓取设备列表和状态</td></tr>
+<tr><td>开机</td><td>启动选中的设备，自动轮询等待就绪</td></tr>
+<tr><td>关机</td><td>关闭运行中的设备（会弹出确认）</td></tr>
+<tr><td>续费</td><td>批量续费所有设备的无卡开机时长</td></tr>
+</table>
+
+<h2>配置保存</h2>
+<div class="tip">在右下角选择设备后保存，SSH 信息会自动绑定到该设备。下次选择设备时自动加载对应配置。</div>
+
+<h2>常见问题</h2>
+<div class="warn">登录时出现验证码：使用「可见浏览器」模式手动完成验证，之后 cookie 会自动保存。</div>
+<div class="warn">连接失败：检查 SSH 地址和端口是否正确，确认设备处于「运行中」状态。</div>
+<div class="tip">勾选「记住密码」和「自动登录」可跳过每次手动输入。</div>
+
+<h2>快捷键</h2>
+<table>
+<tr><th>快捷键</th><th>功能</th></tr>
+<tr><td><kbd>?</kbd> 按钮</td><td>打开本说明页面</td></tr>
+<tr><td>主题切换</td><td>点击右上角切换深色/浅色主题</td></tr>
+</table>
+
+</body>
+</html>'''
+            with open(target, 'w', encoding='utf-8') as f:
+                f.write(html)
             return target
         except Exception:
-            return os.path.join(self.portable_base_dir, 'README.md')
+            return os.path.join(self.portable_base_dir, 'help.html')
 
     def _encryption_pref_path(self):
         try:
@@ -768,14 +844,15 @@ class FletSSHPortForwarder:
             label="备用连接",
             options=[],
             expand=True,
+            text_size=12,
             on_change=self.on_config_combo_change,
         )
-        self.save_config_button = ft.ElevatedButton("保存", on_click=self.save_config)
-        self.delete_config_button = ft.ElevatedButton("删除", on_click=self.delete_config)
-        self.delete_all_button = ft.ElevatedButton("删除全部", on_click=self.delete_all_configs)
+        _cfg_btn_style = ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=4), text_style=ft.TextStyle(size=11))
+        self.save_config_button = ft.ElevatedButton("保存", style=_cfg_btn_style, on_click=self.save_config)
+        self.delete_config_button = ft.ElevatedButton("删除", style=_cfg_btn_style, on_click=self.delete_config)
+        self.delete_all_button = ft.ElevatedButton("删除全部", style=_cfg_btn_style, on_click=self.delete_all_configs)
         config_row = ft.Row(
             controls=[
-                ft.Text("备用连接", weight=ft.FontWeight.BOLD, width=80),
                 self.config_combo,
                 self.save_config_button,
                 self.delete_config_button,
@@ -783,7 +860,7 @@ class FletSSHPortForwarder:
             ],
             alignment=ft.MainAxisAlignment.START,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=10,
+            spacing=6,
         )
         
         self.ssh_info_input = ft.TextField(
@@ -832,12 +909,12 @@ class FletSSHPortForwarder:
                 config_row,
                 ft.Column(
                     controls=[
-                        ft.Row([ft.Text("SSH 连接", width=80, weight=ft.FontWeight.BOLD), self.ssh_info_input]),
-                        ft.Row([ft.Text("远程端口", width=80, weight=ft.FontWeight.BOLD), self.remote_port_input]),
-                        ft.Row([ft.Text("密码", width=80, weight=ft.FontWeight.BOLD), password_row]),
+                        ft.Row([ft.Text("SSH连接", width=55, size=12, weight=ft.FontWeight.BOLD, no_wrap=True), self.ssh_info_input]),
+                        ft.Row([ft.Text("远程端口", width=55, size=12, weight=ft.FontWeight.BOLD, no_wrap=True), self.remote_port_input]),
+                        ft.Row([ft.Text("密码", width=55, size=12, weight=ft.FontWeight.BOLD, no_wrap=True), password_row]),
                         self.auto_open_browser_checkbox,
                     ],
-                    spacing=10,
+                    spacing=8,
                 ),
                 ft.Divider(),
                 buttons_row,
@@ -894,25 +971,31 @@ class FletSSHPortForwarder:
         
         self.autodl_devices_table = ft.DataTable(
             columns=[
-                ft.DataColumn(ft.Text("备注")),
-                ft.DataColumn(ft.Text("设备名称")),
-                ft.DataColumn(ft.Text("状态")),
-                ft.DataColumn(ft.Text("规格")),
-                ft.DataColumn(ft.Text("释放时间")),
-                ft.DataColumn(ft.Text("操作")),
+                ft.DataColumn(ft.Text("#", size=11)),
+                ft.DataColumn(ft.Text("备注", size=11)),
+                ft.DataColumn(ft.Text("设备名称", size=11)),
+                ft.DataColumn(ft.Text("状态", size=11)),
+                ft.DataColumn(ft.Text("规格", size=11)),
+                ft.DataColumn(ft.Text("释放时间", size=11)),
+                ft.DataColumn(ft.Text("操作", size=11)),
             ],
             rows=[],
-            column_spacing=20,
+            column_spacing=12,
+            data_row_min_height=36,
+            data_row_max_height=48,
         )
         table_container = ft.Container(
-            content=ft.Column([self.autodl_devices_table], scroll=ft.ScrollMode.AUTO),
+            content=ft.Column(
+                [ft.Row([self.autodl_devices_table], scroll=ft.ScrollMode.AUTO)],
+                scroll=ft.ScrollMode.AUTO,
+            ),
             expand=True,
             border=ft.border.all(1, ft.colors.OUTLINE),
             border_radius=5,
         )
         
         self.autodl_refresh_button = ft.ElevatedButton("刷新并检测GPU", on_click=self.autodl_refresh_devices, disabled=True)
-        open_list_btn = ft.ElevatedButton("打开设备列表网页", on_click=lambda e: webbrowser.open('https://www.autodl.com/console/instance/list'))
+        open_list_btn = ft.ElevatedButton("打开设备列表网页", on_click=lambda e: _open_url_and_focus('https://www.autodl.com/console/instance/list'))
         self.autodl_renew_button = ft.ElevatedButton("一键续费", on_click=self._on_renew_click, disabled=True, tooltip="逐台开机再关机，防止机器被销毁")
         self.autodl_shutdown_all_button = ft.ElevatedButton("一键关机", on_click=self._on_shutdown_all_click, disabled=True, tooltip="关闭所有运行中的设备")
         batch_row = ft.Row(
@@ -1022,27 +1105,17 @@ class FletSSHPortForwarder:
         if not self.running or self.page is None:
             return
         
-        # 2. 将整个控件创建和添加过程包裹在 try 块中
-        # 报错 Traceback 显示错误发生在创建 ft.Text 时
         try:
-            # 颜色逻辑
+            # 日志颜色：只区分错误（红色）和普通（默认色）
+            is_dark = (self.current_theme == 'dark')
+            
             log_color = None  # None = 跟随主题默认色
-            if "[SSH]" in full_msg:
-                log_color = "blue700"
-            elif "[AutoDL]" in full_msg:
-                log_color = "green700"
-                
             msg_lower = full_msg.lower()
             if any(k in msg_lower for k in ["失败", "错误", "异常", "error", "fail", "exception"]):
-                log_color = "red600"
-            elif any(k in msg_lower for k in ["成功", "完成", "已连接", "已运行", "success", "done"]):
-                if "[SSH]" in full_msg: log_color = "blue900"
-                else: log_color = "green900"
-            elif any(k in msg_lower for k in ["正在", "等待", "准备", "waiting", "preparing"]):
-                log_color = "orange800"
+                log_color = "#EF9A9A" if is_dark else "#C62828"  # 浅红 / 深红
 
             # 创建控件
-            log_entry = ft.Text(full_msg, size=12, color=log_color, weight="w500" if log_color else None)
+            log_entry = ft.Text(full_msg, size=11, color=log_color)
             
             # 添加到列表
             if self.log_listview and self.log_listview.controls is not None:
@@ -1058,11 +1131,9 @@ class FletSSHPortForwarder:
                 self._last_ui_update = now
 
         except RuntimeError as e:
-            # 捕获并忽略 shutdown 错误
             if "schedule new futures" in str(e) or "shutdown" in str(e):
                 return
         except Exception:
-            # 忽略其他错误，防止写日志本身导致崩溃
             pass
 
     def update_status(self, message):
@@ -1131,8 +1202,9 @@ class FletSSHPortForwarder:
     def update_device_table(self, data_list):
         if not self.running:
             return
+        self._cached_devices = data_list  # 缓存设备数据供下拉框使用
         rows = []
-        for data in data_list:
+        for idx, data in enumerate(data_list, 1):
             remark = data.get('remark', '')
             device_name = data.get('device_name', '未知设备')
             status = data.get('status', '未知状态')
@@ -1147,29 +1219,35 @@ class FletSSHPortForwarder:
             elif '已关机' in status or 'stopped' in status.lower():
                 status_color = ft.colors.GREY
             
-            status_cell = ft.DataCell(ft.Text(status, color=status_color, size=12))
+            status_cell = ft.DataCell(ft.Text(status, color=status_color, size=11))
             
-            # 释放时间颜色（越近越红，其余跟主题走）
+            # 释放时间颜色（越近越红，其余跟主题走）— 只显示天数
             release_color = None
+            release_short = release_time
             if release_time:
                 import re as _re
                 day_match = _re.search(r'(\d+)\s*天', release_time)
-                days = int(day_match.group(1)) if day_match else 99
-                if days <= 3:
-                    release_color = "red"
-                elif days <= 7:
-                    release_color = "orange"
-            release_cell = ft.DataCell(ft.Text(release_time, color=release_color, size=12))
+                if day_match:
+                    days = int(day_match.group(1))
+                    release_short = f"{days}天"
+                    if days <= 3:
+                        release_color = "red"
+                    elif days <= 7:
+                        release_color = "orange"
+                else:
+                    release_short = release_time.replace('后释放', '').strip()
+            release_cell = ft.DataCell(ft.Text(release_short, color=release_color, size=11))
             
             # 操作按钮
             actions_cell = self._create_action_cells(device_id, remark, status, specs, device_name)
             
             row = ft.DataRow(
                 cells=[
-                    ft.DataCell(ft.Text(remark, size=12)),
-                    ft.DataCell(ft.Text(device_name, size=12)),
+                    ft.DataCell(ft.Text(str(idx), size=11)),
+                    ft.DataCell(ft.Text(remark, size=11)),
+                    ft.DataCell(ft.Text(device_name, size=11)),
                     status_cell,
-                    ft.DataCell(ft.Text(specs, size=12)),
+                    ft.DataCell(ft.Text(specs, size=11)),
                     release_cell,
                     ft.DataCell(actions_cell),
                 ]
@@ -1179,40 +1257,45 @@ class FletSSHPortForwarder:
         self.safe_update()
 
     def _create_action_cells(self, device_id, remark, status, specs, device_name):
+        _btn_style = ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=4), text_style=ft.TextStyle(size=11))
         if '已关机' in status or '关机' in status or 'stopped' in status.lower():
-            start_btn = ft.ElevatedButton("开机", on_click=lambda e, d=device_id, r=remark: self.autodl_start_only(d, r))
-            smart_btn = ft.ElevatedButton("开机并连接", on_click=lambda e, d=device_id, r=remark: self.autodl_start(d, r))
-            setup_btn = ft.ElevatedButton("设置连接信息", on_click=lambda e, d=device_id, r=remark, g=specs, l=device_name: self._open_device_config_dialog(d, r, g, l))
-            nogpu_btn = ft.ElevatedButton("无卡开机", on_click=lambda e, d=device_id, r=remark: self.autodl_start_nogpu(d, r))
+            start_btn = ft.ElevatedButton("开机", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_start_only(d, r))
+            smart_btn = ft.ElevatedButton("开机并连接", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_start(d, r))
+            setup_btn = ft.ElevatedButton("设置连接", style=_btn_style, on_click=lambda e, d=device_id, r=remark, g=specs, l=device_name: self._open_device_config_dialog(d, r, g, l))
+            nogpu_btn = ft.ElevatedButton("无卡开机", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_start_nogpu(d, r))
             if self._gpu_insufficient(status, specs):
                 start_btn.disabled = True
                 smart_btn.disabled = True
                 start_btn.tooltip = "GPU配额不足，无法开机"
                 smart_btn.tooltip = "GPU配额不足，无法开机"
-            action_row = ft.Row(controls=[start_btn, smart_btn, setup_btn, nogpu_btn], spacing=5)
+            action_row = ft.Row(controls=[start_btn, smart_btn, setup_btn, nogpu_btn], spacing=4, wrap=False)
             return action_row
         elif '运行中' in status or 'running' in status.lower():
-            stop_btn = ft.ElevatedButton("关机", on_click=lambda e, d=device_id, r=remark: self.autodl_stop(d, r))
-            forward_btn = ft.ElevatedButton("转发", on_click=lambda e, d=device_id, r=remark: self.autodl_forward_only(d, r))
-            connect_btn = ft.ElevatedButton("启动并连接", on_click=lambda e, d=device_id, r=remark: self.autodl_connect_device(d, r))
-            jupyter_btn = ft.ElevatedButton("JupyterLab", on_click=lambda e, d=device_id, r=remark: self.autodl_click_jupyterlab(d, r))
-            autopanel_btn = ft.ElevatedButton("AutoPanel", on_click=lambda e, d=device_id, r=remark: self.autodl_click_autopanel(d, r))
-            setup_btn = ft.ElevatedButton("设置连接信息", on_click=lambda e, d=device_id, r=remark, g=specs, l=device_name: self._open_device_config_dialog(d, r, g, l))
-            action_row = ft.Row(controls=[stop_btn, forward_btn, connect_btn, jupyter_btn, autopanel_btn, setup_btn], spacing=5)
+            stop_btn = ft.ElevatedButton("关机", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_stop(d, r))
+            forward_btn = ft.ElevatedButton("转发", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_forward_only(d, r))
+            connect_btn = ft.ElevatedButton("连接", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_connect_device(d, r))
+            jupyter_btn = ft.ElevatedButton("Jupyter", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_click_jupyterlab(d, r))
+            autopanel_btn = ft.ElevatedButton("Panel", style=_btn_style, on_click=lambda e, d=device_id, r=remark: self.autodl_click_autopanel(d, r))
+            setup_btn = ft.ElevatedButton("设置连接", style=_btn_style, on_click=lambda e, d=device_id, r=remark, g=specs, l=device_name: self._open_device_config_dialog(d, r, g, l))
+            action_row = ft.Row(controls=[stop_btn, forward_btn, connect_btn, jupyter_btn, autopanel_btn, setup_btn], spacing=4, wrap=False)
             return action_row
         else:
             return ft.Row()
 
     # ---------- 对话框辅助 ----------
+    def _open_dialog(self, dlg):
+        """统一打开对话框，兼容 Flet 0.21+ overlay API"""
+        self.page.overlay.append(dlg)
+        dlg.open = True
+        self.safe_update()
+
     def show_message(self, title, message):
         dlg = ft.AlertDialog(
             title=ft.Text(title),
             content=ft.Text(message),
             actions=[ft.TextButton("确定", on_click=lambda e: self.close_dialog(dlg))],
         )
-        self.page.dialog = dlg
-        dlg.open = True
-        self.safe_update()
+        self._open_dialog(dlg)
 
     def confirm_dialog(self, title, message, on_confirm):
         dlg = ft.AlertDialog(
@@ -1223,9 +1306,7 @@ class FletSSHPortForwarder:
                 ft.TextButton("否", on_click=lambda e: self.close_dialog(dlg)),
             ],
         )
-        self.page.dialog = dlg
-        dlg.open = True
-        self.safe_update()
+        self._open_dialog(dlg)
 
     def input_dialog(self, title, message, on_ok):
         txt = ft.TextField(label=message)
@@ -1237,13 +1318,19 @@ class FletSSHPortForwarder:
                 ft.TextButton("取消", on_click=lambda e: self.close_dialog(dlg)),
             ],
         )
-        self.page.dialog = dlg
-        dlg.open = True
-        self.safe_update()
+        self._open_dialog(dlg)
 
     def close_dialog(self, dlg):
         dlg.open = False
         self.safe_update()
+        # 延迟移除，避免关闭动画未完成时留下空白残影
+        def _remove():
+            try:
+                self.page.overlay.remove(dlg)
+                self.safe_update()
+            except (ValueError, AttributeError):
+                pass
+        threading.Timer(0.3, _remove).start()
 
     def _on_confirm(self, dlg, callback):
         self.close_dialog(dlg)
@@ -1272,6 +1359,41 @@ class FletSSHPortForwarder:
                 raise ValueError()
         except ValueError:
             self.show_message("输入错误", "请输入有效的端口号（1-65535）")
+            return
+
+        # 如果选择了未配置的设备，直接保存并绑定
+        bind = getattr(self, '_pending_device_bind', None)
+        if bind:
+            device_id = bind['device_id']
+            remark = bind['remark']
+            safe_name = self._sanitize_name(remark) or (device_id[-8:] if device_id else '设备')
+            config_data = {
+                'ssh_info': ssh_info,
+                'remote_port': remote_port,
+                'password': password,
+                'auto_open_browser': auto_open,
+                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'device_id': device_id,
+                'remark': remark,
+            }
+            if password and self.encryption_enabled:
+                enc = _win_dpapi_encrypt(password)
+                if enc:
+                    config_data['password'] = enc
+            cfg_path = os.path.join(self.config_dir, f'{safe_name}.json')
+            try:
+                with open(cfg_path, 'w', encoding='utf-8') as f:
+                    json.dump(config_data, f, ensure_ascii=False, indent=2)
+                m = self._load_device_map()
+                m[device_id] = safe_name
+                self._save_device_map(m)
+                self._pending_device_bind = None
+                self.load_config_list()
+                self.config_combo.value = safe_name
+                self.safe_update()
+                self.show_message("保存成功", f'已保存并绑定到设备 [{remark}]')
+            except Exception as ex:
+                self.show_message("保存失败", str(ex))
             return
 
         def on_input(config_name):
@@ -1385,18 +1507,33 @@ class FletSSHPortForwarder:
         if not self.config_dir or not os.path.exists(self.config_dir):
             return
         try:
-            config_files = [f for f in os.listdir(self.config_dir) if f.endswith('.json') and f != 'device_map.json' and f != 'autodl_credentials.json' and f != 'theme.json']
+            _exclude = {'device_map.json', 'autodl_credentials.json', 'autodl_cookies.json', 'autodl_storage.json', 'theme.json', 'window_settings.json'}
+            config_files = [f for f in os.listdir(self.config_dir) if f.endswith('.json') and f not in _exclude]
+            saved_device_ids = set()
             for fname in sorted(config_files):
                 config_name = os.path.splitext(fname)[0]
                 display_name = config_name
                 try:
                     with open(os.path.join(self.config_dir, fname), 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                        if isinstance(data, dict) and data.get('remark'):
-                            display_name = data.get('remark')
+                        if isinstance(data, dict):
+                            if data.get('remark'):
+                                display_name = data.get('remark')
+                            if data.get('device_id'):
+                                saved_device_ids.add(data['device_id'])
                 except:
                     pass
                 self.config_combo.options.append(ft.dropdown.Option(key=config_name, text=display_name))
+            # 追加未保存配置的设备（来自设备列表）
+            cached = getattr(self, '_cached_devices', None) or []
+            for dev in cached:
+                did = dev.get('device_id', '')
+                rem = dev.get('remark', '') or dev.get('device_name', '')
+                if did and did not in saved_device_ids and rem:
+                    # key 用 device: 前缀区分，选中时触发新建配置
+                    self.config_combo.options.append(
+                        ft.dropdown.Option(key=f"device:{did}", text=f"📱 {rem} (未配置)")
+                    )
             self.safe_update()
         except Exception as e:
             self.update_status_signal.emit(f'加载配置列表时出错: {str(e)}')
@@ -1405,6 +1542,21 @@ class FletSSHPortForwarder:
         config_key = self.config_combo.value
         if not config_key:
             return
+        # 选择了未配置的设备 — 清空输入框，提示用户填写
+        if config_key.startswith('device:'):
+            device_id = config_key[7:]
+            cached = getattr(self, '_cached_devices', None) or []
+            dev_info = next((d for d in cached if d.get('device_id') == device_id), None)
+            remark = (dev_info.get('remark', '') if dev_info else '') or device_id[-8:]
+            self.ssh_info_input.value = ''
+            self.remote_port_input.value = ''
+            self.password_input.value = ''
+            self.auto_open_browser_checkbox.value = True
+            self._pending_device_bind = {'device_id': device_id, 'remark': remark}
+            self.update_status_signal.emit(f'已选择设备 [{remark}]，请填写 SSH 信息后点击保存')
+            self.safe_update()
+            return
+        self._pending_device_bind = None
         config_file = os.path.join(self.config_dir, f'{config_key}.json')
         if not os.path.exists(config_file):
             self.show_message("文件不存在", f'配置文件不存在: {config_key}')
@@ -1608,7 +1760,7 @@ class FletSSHPortForwarder:
                     url = f'http://127.0.0.1:{remote_port}'
                     self.update_status_signal.emit(f'正在打开浏览器: {url}')
                     try:
-                        success = webbrowser.open(url)
+                        success = _open_url_and_focus(url)
                         if success:
                             self.update_status_signal.emit(f'浏览器已成功打开: {url}')
                         else:
@@ -1632,14 +1784,13 @@ class FletSSHPortForwarder:
                 try:
                     tcur = self.ssh_client.get_transport()
                     if (not tcur) or (not tcur.is_active()):
-                        okr = self._reconnect_in_place()
-                        if not okr:
-                            time.sleep(1.0)
-                            continue
-                        tcur = self.ssh_client.get_transport()
-                        if not tcur or not tcur.is_active():
-                            time.sleep(1.0)
-                            continue
+                        if not self.reconnecting:
+                            threading.Thread(
+                                target=self._reconnect_in_place,
+                                daemon=True
+                            ).start()
+                        time.sleep(1.0)
+                        continue
                     if self.auto_open_browser_checkbox.value and not browser_opened:
                         now = time.time()
                         if now - last_browser_try >= 3.0:
@@ -1650,7 +1801,7 @@ class FletSSHPortForwarder:
                                     ch2.close()
                                     url2 = f'http://127.0.0.1:{remote_port}'
                                     try:
-                                        okweb = webbrowser.open(url2)
+                                        okweb = _open_url_and_focus(url2)
                                         if okweb:
                                             self.update_status_signal.emit(f'浏览器已成功打开: {url2}')
                                         else:
@@ -1661,6 +1812,8 @@ class FletSSHPortForwarder:
                             except Exception:
                                 pass
                     readable, _, _ = select.select([self.server_socket], [], [], 0.2)
+                    # 定期清理已完成的客户端线程，防止列表无限增长
+                    self.client_threads = [t for t in self.client_threads if t.is_alive()]
                     if readable:
                         client_socket, addr = self.server_socket.accept()
                         try:
@@ -1778,7 +1931,7 @@ class FletSSHPortForwarder:
                 if attempt > 0:
                     wait = min(2 ** attempt, 30) # 缩短最大等待时间，提高响应感
                     self.update_status_signal.emit(f'重连尝试 ({attempt}/{max_retries})，{wait}秒后重试...')
-                    time.sleep(wait)
+                    self.stop_event.wait(wait)  # 可被 stop_event.set() 立即中断
                 
                 c = paramiko.SSHClient()
                 c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -1808,7 +1961,7 @@ class FletSSHPortForwarder:
                     self.update_status_signal.emit(f'重连失败 ({attempt}/{max_retries})，{wait}秒后重试...')
                     if self.stop_event.is_set():
                         break
-                    time.sleep(wait)
+                    self.stop_event.wait(wait)  # 可被 stop_event.set() 立即中断
             self.update_status_signal.emit('达到最大重试次数，放弃连接')
             self.disconnect()
             self.reconnecting = False
@@ -1818,6 +1971,9 @@ class FletSSHPortForwarder:
             return False
 
     def _detect_device_shutdown_for_reconnect(self):
+        # 非阻塞获取锁，其他操作正在使用 driver 时跳过检测
+        if not self.selenium_lock.acquire(blocking=False):
+            return False
         try:
             if not self.autodl_driver or not self.is_autodl_logged_in:
                 return False
@@ -1842,6 +1998,11 @@ class FletSSHPortForwarder:
             return False
         except Exception:
             return False
+        finally:
+            try:
+                self.selenium_lock.release()
+            except RuntimeError:
+                pass
 
     def _recreate_server_socket(self, remote_port):
         try:
@@ -1884,6 +2045,7 @@ class FletSSHPortForwarder:
 
         self.forward_thread = None
         self.client_threads = []
+        self.reconnecting = False
         self.connection_status_signal.emit(False)
         self.update_status_signal.emit('连接已完全断开')
         self.stop_event.clear()
@@ -1908,117 +2070,320 @@ class FletSSHPortForwarder:
         threading.Thread(target=login_thread, daemon=True).start()
 
     def _login_via_list_tag(self, username, password, headless):
+        """登录 AutoDL：打开登录页 → 输密码 → 点按钮 → 等跳转 → 去设备列表"""
+        login_url = 'https://www.autodl.com/login'
+        list_url = 'https://www.autodl.com/console/instance/list'
         try:
-            # 增加驱动存活检查，避免重复初始化
+            # ── 1. 初始化浏览器 ──
             is_driver_alive = False
             if self.autodl_driver:
                 try:
-                    # 尝试获取标题，如果成功说明驱动还在
                     _ = self.autodl_driver.title
                     is_driver_alive = True
                 except Exception:
                     is_driver_alive = False
-            
+
             if not is_driver_alive:
-                self.autodl_status_signal.emit('正在初始化浏览器环境...')
+                self.autodl_status_signal.emit('准备环境...')
                 if not self.init_autodl_driver(headless=headless):
                     return
             else:
                 self.autodl_status_signal.emit('重用已开启的浏览器...')
+
+            # ── 2. 先尝试直接访问设备列表，看是否已登录 ──
             self.autodl_status_signal.emit('正在访问AutoDL...')
-            list_url = 'https://www.autodl.com/console/instance/list'
             try:
                 self.autodl_driver.get(list_url)
             except Exception:
                 pass
-            time.sleep(1)
-            cu = ''
+            time.sleep(1.5)
+
+            cur_url = ''
             try:
-                cu = self.autodl_driver.current_url
-            except Exception:
-                cu = ''
-            if 'login' in cu:
-                self.autodl_status_signal.emit('检测到登录页面，准备登录...')
-                if not password:
-                    self.autodl_status_signal.emit('请输入密码进行登录')
-                    return
-                pw = None
-                try:
-                     WebDriverWait(self.autodl_driver, 10).until(EC.presence_of_element_located((By.XPATH, "//input[@type='password']")))
-                     pws = self.autodl_driver.find_elements(By.XPATH, "//input[@type='password']")
-                     if pws: pw = pws[0]
-                except Exception:
-                    pass
-                un = None
-                try:
-                    cands = self.autodl_driver.find_elements(By.XPATH, "//input[@type='text'] | //input[@type='tel']")
-                    if cands:
-                        un = cands[-1]
-                except Exception:
-                    un = None
-                if un and username:
-                    try:
-                        self.autodl_status_signal.emit('正在输入用户名...')
-                        un.clear()
-                        un.send_keys(username)
-                    except Exception:
-                        pass
-                if pw and password:
-                    try:
-                        self.autodl_status_signal.emit('正在输入密码...')
-                        pw.clear()
-                        pw.send_keys(password)
-                    except Exception:
-                        pass
-                btn = None
-                for xp in [
-                    ".//button[contains(normalize-space(),'登录')]",
-                    "//button[contains(normalize-space(),'登录')]",
-                    "//*[contains(@class,'el-button--primary')]",
-                ]:
-                    try:
-                        btn = self.autodl_driver.find_element(By.XPATH, xp)
-                        break
-                    except Exception:
-                        continue
-                if btn:
-                    try:
-                        self.autodl_status_signal.emit('正在点击登录按钮...')
-                        self.autodl_driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                        time.sleep(0.5)
-                        try:
-                            btn.click()
-                        except:
-                            self.autodl_driver.execute_script('arguments[0].click();', btn)
-                    except Exception:
-                        pass
-                self.autodl_status_signal.emit('等待登录跳转...')
-                time.sleep(2)
-                try:
-                    WebDriverWait(self.autodl_driver, 5).until(lambda d: 'login' not in d.current_url)
-                except:
-                    pass
-            try:
-                self.autodl_driver.get(list_url)
+                cur_url = self.autodl_driver.current_url
             except Exception:
                 pass
-            time.sleep(1)
-            final_url = ''
-            try:
-                final_url = self.autodl_driver.current_url
-            except:
-                pass
-            if 'login' in final_url:
-                self.autodl_status_signal.emit('登录失败：未能进入控制台，请检查账号密码')
-                self.autodl_login_signal.emit(False)
-            else:
+
+            # 如果没被重定向到 login，说明已登录
+            if 'login' not in cur_url and ('console' in cur_url or 'homepage' in cur_url):
+                self._log_to_file("已有登录态，无需重新登录")
                 self.autodl_login_signal.emit(True)
                 self.is_autodl_logged_in = True
-                self.autodl_status_signal.emit('登录成功')
-                # 登录成功后自动刷新
+                self.autodl_status_signal.emit('已登录（使用缓存会话）')
                 self.autodl_refresh_devices_quick()
+                return
+
+            # ── 3. 需要登录：直接打开登录页 ──
+            if not password:
+                self.autodl_status_signal.emit('请输入密码进行登录')
+                return
+
+            self.autodl_status_signal.emit('正在打开登录页...')
+            try:
+                self.autodl_driver.get(login_url)
+            except Exception:
+                pass
+
+            # 等待密码输入框出现
+            try:
+                WebDriverWait(self.autodl_driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//input[@type='password']"))
+                )
+            except Exception:
+                self.autodl_status_signal.emit('登录失败：登录页加载超时')
+                self._log_to_file("登录页加载超时，密码输入框未出现")
+                self.autodl_login_signal.emit(False)
+                return
+
+            # ── 4. 输入用户名和密码 ──
+            if username:
+                try:
+                    un_inputs = self.autodl_driver.find_elements(By.XPATH, "//input[@type='text'] | //input[@type='tel']")
+                    if un_inputs:
+                        self.autodl_status_signal.emit('正在输入用户名...')
+                        un_inputs[-1].clear()
+                        un_inputs[-1].send_keys(username)
+                except Exception as e:
+                    self._log_to_file(f"输入用户名失败: {e}")
+
+            try:
+                pw_inputs = self.autodl_driver.find_elements(By.XPATH, "//input[@type='password']")
+                if pw_inputs:
+                    self.autodl_status_signal.emit('正在输入密码...')
+                    pw_inputs[0].clear()
+                    pw_inputs[0].send_keys(password)
+            except Exception as e:
+                self._log_to_file(f"输入密码失败: {e}")
+
+            # ── 5. 点击登录按钮 ──
+            btn = None
+            for xp in [
+                "//button[contains(normalize-space(),'登录')]",
+                "//*[contains(@class,'el-button--primary')]",
+            ]:
+                try:
+                    btn = self.autodl_driver.find_element(By.XPATH, xp)
+                    break
+                except Exception:
+                    continue
+
+            if not btn:
+                self.autodl_status_signal.emit('登录失败：找不到登录按钮')
+                self._log_to_file("登录失败：找不到登录按钮")
+                self.autodl_login_signal.emit(False)
+                return
+
+            self.autodl_status_signal.emit('正在点击登录按钮...')
+            try:
+                self.autodl_driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                time.sleep(0.3)
+                try:
+                    btn.click()
+                except Exception:
+                    self.autodl_driver.execute_script('arguments[0].click();', btn)
+            except Exception as e:
+                self._log_to_file(f"点击登录按钮失败: {e}")
+
+            # ── 6. 等待跳转：登录成功会跳到 console/homepage ──
+            self.autodl_status_signal.emit('等待登录跳转...')
+            login_success = False
+            try:
+                WebDriverWait(self.autodl_driver, 6).until(
+                    lambda d: 'console' in d.current_url or 'homepage' in d.current_url
+                )
+                login_success = True
+            except Exception:
+                pass
+
+            # ── 7. 如果没跳转，诊断原因 ──
+            if not login_success:
+                diag = self._diagnose_login_failure()
+
+                if diag == 'captcha':
+                    # 需要验证码：如果是 headless 模式，切到可见模式让用户手动过
+                    if headless:
+                        self.autodl_status_signal.emit('检测到验证码，正在切换到可见模式...')
+                        self._log_to_file("检测到验证码，切换可见模式")
+                        try:
+                            self.autodl_driver.quit()
+                        except Exception:
+                            pass
+                        self.autodl_driver = None
+                        # 用可见模式重新走一遍登录
+                        self._login_via_list_tag(username, password, headless=False)
+                        return
+                    else:
+                        # 已经是可见模式，等用户手动过验证码
+                        self.autodl_status_signal.emit('请在浏览器中手动完成验证码...')
+                        try:
+                            WebDriverWait(self.autodl_driver, 120).until(
+                                lambda d: 'console' in d.current_url or 'homepage' in d.current_url
+                            )
+                            login_success = True
+                            self.autodl_status_signal.emit('验证码已通过')
+                        except Exception:
+                            self.autodl_status_signal.emit('验证码等待超时')
+
+                elif diag == 'password_error':
+                    self.autodl_status_signal.emit('登录失败：密码错误，请检查密码是否正确')
+                    self._log_to_file("登录失败：密码错误")
+                    self.autodl_login_signal.emit(False)
+                    return
+
+                elif diag == 'account_error':
+                    self.autodl_status_signal.emit('登录失败：账号不存在或已被禁用')
+                    self._log_to_file("登录失败：账号异常")
+                    self.autodl_login_signal.emit(False)
+                    return
+
+                else:
+                    # 未知原因，再等几秒看看
+                    try:
+                        WebDriverWait(self.autodl_driver, 5).until(
+                            lambda d: 'console' in d.current_url or 'homepage' in d.current_url
+                        )
+                        login_success = True
+                    except Exception:
+                        pass
+
+            # ── 8. 最终判定 ──
+            if not login_success:
+                self._save_login_debug_screenshot()
+                page_text = ''
+                try:
+                    page_text = self.autodl_driver.find_element(By.TAG_NAME, 'body').text[:500]
+                except Exception:
+                    pass
+                self._log_to_file(f"登录最终失败，URL: {self.autodl_driver.current_url}, 页面文本: {page_text}")
+                self.autodl_status_signal.emit('登录失败：未能进入控制台，请检查账号密码')
+                self.autodl_login_signal.emit(False)
+                return
+
+            # ── 9. 登录成功，跳转到设备列表 ──
+            self.autodl_status_signal.emit('登录成功，正在加载设备列表...')
+            self._log_to_file(f"登录成功，当前URL: {self.autodl_driver.current_url}")
+            try:
+                self.autodl_driver.get(list_url)
+            except Exception:
+                pass
+            time.sleep(1)
+
+            self.autodl_login_signal.emit(True)
+            self.is_autodl_logged_in = True
+            self.autodl_status_signal.emit('登录成功')
+            self.autodl_refresh_devices_quick()
+
         except Exception as e:
             self.autodl_status_signal.emit(f'登录过程出错: {str(e)}')
+            self._log_to_file(f'登录过程异常: {traceback.format_exc()}')
+
+    def _diagnose_login_failure(self):
+        """诊断登录失败原因，返回: 'captcha' / 'password_error' / 'account_error' / 'unknown'"""
+        if not self.autodl_driver:
+            return 'unknown'
+        try:
+            page_text = ''
+            try:
+                page_text = self.autodl_driver.find_element(By.TAG_NAME, 'body').text
+            except Exception:
+                pass
+
+            # 检测验证码相关元素（精确匹配，避免误判）
+            # 高置信度：专门的验证码组件
+            captcha_xpaths_strict = [
+                "//*[contains(@class,'captcha')]",
+                "//*[contains(@class,'geetest')]",
+                "//*[contains(@class,'tcaptcha')]",
+                "//*[contains(@id,'captcha')]",
+                "//*[contains(@id,'geetest')]",
+            ]
+            for xp in captcha_xpaths_strict:
+                try:
+                    elems = self.autodl_driver.find_elements(By.XPATH, xp)
+                    for el in elems:
+                        if el.is_displayed():
+                            self._log_to_file(f"检测到验证码元素(高置信): xpath={xp}, tag={el.tag_name}, class={el.get_attribute('class')}")
+                            return 'captcha'
+                except Exception:
+                    continue
+
+            # 中置信度：slider/verify 需要额外检查尺寸，排除普通 UI 组件
+            captcha_xpaths_medium = [
+                "//*[contains(@class,'slider') and contains(@class,'captcha')]",
+                "//*[contains(@class,'verify') and contains(@class,'captcha')]",
+                "//*[contains(@class,'slider') and contains(@class,'verify')]",
+            ]
+            for xp in captcha_xpaths_medium:
+                try:
+                    elems = self.autodl_driver.find_elements(By.XPATH, xp)
+                    for el in elems:
+                        if el.is_displayed():
+                            self._log_to_file(f"检测到验证码元素(中置信): xpath={xp}, tag={el.tag_name}, class={el.get_attribute('class')}")
+                            return 'captcha'
+                except Exception:
+                    continue
+
+            # 注意：已移除 //canvas、mask、modal、dialog 等宽泛选择器，
+            # 这些在现代网页上极易误判（背景动画、弹窗等）
+
+            # 检测验证码相关文字（精确匹配，避免"验证"单字误判）
+            captcha_keywords = ['滑动验证', '拖动滑块', '拼图验证', '安全验证', '图形验证', '请完成验证']
+            for kw in captcha_keywords:
+                if kw in page_text:
+                    self._log_to_file(f"页面文本包含验证码关键词: '{kw}'")
+                    return 'captcha'
+
+            # 检测密码错误提示
+            pwd_error_keywords = ['密码错误', '密码不正确', '账号或密码', '用户名或密码', '登录失败']
+            for kw in pwd_error_keywords:
+                if kw in page_text:
+                    self._log_to_file(f"页面文本包含密码错误关键词: '{kw}'")
+                    return 'password_error'
+
+            # 检测账号异常
+            account_keywords = ['账号不存在', '账号已禁用', '账号异常', '已被封禁']
+            for kw in account_keywords:
+                if kw in page_text:
+                    self._log_to_file(f"页面文本包含账号异常关键词: '{kw}'")
+                    return 'account_error'
+
+            # 检测页面上是否有错误提示元素（el-message、toast 等）
+            error_xpaths = [
+                "//*[contains(@class,'el-message--error')]",
+                "//*[contains(@class,'el-message-box')]",
+                "//*[contains(@class,'error-msg')]",
+                "//*[contains(@class,'toast')]",
+                "//*[contains(@class,'ant-message')]",
+            ]
+            for xp in error_xpaths:
+                try:
+                    elems = self.autodl_driver.find_elements(By.XPATH, xp)
+                    for el in elems:
+                        if el.is_displayed() and el.text.strip():
+                            self._log_to_file(f"检测到错误提示: '{el.text.strip()}'")
+                            if any(k in el.text for k in pwd_error_keywords):
+                                return 'password_error'
+                            return 'unknown'
+                except Exception:
+                    continue
+
+            self._log_to_file(f"登录失败诊断：未检测到明确原因，页面文本前200字: {page_text[:200]}")
+            return 'unknown'
+        except Exception as e:
+            self._log_to_file(f"登录诊断异常: {e}")
+            return 'unknown'
+
+    def _save_login_debug_screenshot(self):
+        """保存登录失败时的截图用于调试"""
+        try:
+            debug_dir = os.path.join(self.config_dir, 'debug')
+            os.makedirs(debug_dir, exist_ok=True)
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            path = os.path.join(debug_dir, f'login_fail_{ts}.png')
+            self.autodl_driver.save_screenshot(path)
+            self._log_to_file(f"登录失败截图已保存: {path}")
+        except Exception as e:
+            self._log_to_file(f"保存登录截图失败: {e}")
 
     def autodl_logout(self, e=None):
         try:
@@ -2099,8 +2464,18 @@ class FletSSHPortForwarder:
             chrome_options.add_argument('--disable-dev-shm-usage')
             chrome_options.add_argument('--disable-gpu')
             chrome_options.add_argument('--disable-software-rasterizer')
-            chrome_options.add_argument('--remote-debugging-port=0') # 强制使用随机端口
+            chrome_options.add_argument('--remote-debugging-port=0')
             chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--no-proxy-server')
+            # ── 反自动化指纹 ──
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            # 使用持久化 profile 目录，保留浏览历史和 cookie，降低验证码风控
+            # 临时 profile 会被验证码服务识别为机器人（无历史数据）
+            chrome_profile_dir = os.path.join(self.config_dir, 'chrome_profile')
+            os.makedirs(chrome_profile_dir, exist_ok=True)
+            chrome_options.add_argument(f'--user-data-dir={chrome_profile_dir}')
+            chrome_options.add_argument('--profile-directory=Default')
             
             # 4. 本地驱动极速探测
             local_exe = os.path.join(self.config_dir, 'chromedriver.exe')
@@ -2113,6 +2488,7 @@ class FletSSHPortForwarder:
                     
                     # 给 Chrome 启动本身加一个超时尝试
                     self.autodl_driver = webdriver.Chrome(service=service, options=chrome_options)
+                    self._apply_stealth_scripts()
                     self._log_to_file("本地驱动加载成功")
                     self.autodl_status_signal.emit('本地驱动秒开成功')
                     return True
@@ -2135,6 +2511,7 @@ class FletSSHPortForwarder:
                 
                 self._log_to_file("正在通过 WDM 路径启动浏览器...")
                 self.autodl_driver = webdriver.Chrome(service=service, options=chrome_options)
+                self._apply_stealth_scripts()
                 self._log_to_file("浏览器启动成功")
                 
                 # 下载成功后立即备份到本地，确保下次秒开
@@ -2181,6 +2558,7 @@ class FletSSHPortForwarder:
                 fallback_options.add_argument('--no-first-run')
                 fallback_options.add_argument('--no-default-browser-check')
                 fallback_options.add_argument('--remote-debugging-port=0')
+                fallback_options.add_argument('--no-proxy-server')  # 绕过系统代理
                 fallback_options.add_argument(f'--user-data-dir={tmp_dir}')
                 fallback_options.add_argument('--profile-directory=Default')
                 fallback_options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -2214,6 +2592,7 @@ class FletSSHPortForwarder:
                 try:
                     self.autodl_driver.implicitly_wait(0)
                 except: pass
+                self._apply_stealth_scripts()
                 return True
             except Exception as e2:
                 if headless:
@@ -2223,6 +2602,10 @@ class FletSSHPortForwarder:
                         visible_options.add_argument('--no-first-run')
                         visible_options.add_argument('--no-default-browser-check')
                         visible_options.add_argument('--remote-debugging-port=0')
+                        visible_options.add_argument('--no-proxy-server')
+                        visible_options.add_argument('--disable-blink-features=AutomationControlled')
+                        visible_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                        visible_options.add_experimental_option('useAutomationExtension', False)
                         try:
                             profile_dir2 = os.path.join(self.config_dir, 'chrome_profile_visible')
                             os.makedirs(profile_dir2, exist_ok=True)
@@ -2236,6 +2619,7 @@ class FletSSHPortForwarder:
                         except Exception:
                             service = Service(ChromeDriverManager().install())
                             self.autodl_driver = webdriver.Chrome(service=service, options=visible_options)
+                        self._apply_stealth_scripts()
                         return True
                     except Exception:
                         pass
@@ -2270,6 +2654,43 @@ class FletSSHPortForwarder:
         except Exception:
             pass
             
+    def _apply_stealth_scripts(self):
+        """注入反自动化检测脚本，隐藏 Selenium/WebDriver 指纹"""
+        if not self.autodl_driver:
+            return
+        try:
+            # 通过 CDP 在每个页面加载前自动注入
+            self.autodl_driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    // 隐藏 webdriver 标记
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    // 伪造 plugins（正常浏览器至少有几个插件）
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    // 伪造 languages
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['zh-CN', 'zh', 'en']
+                    });
+                    // 移除 Chrome 自动化相关的 window 属性
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+                    // 覆盖 chrome.runtime 使其看起来像正常浏览器
+                    window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+                    // 伪造 permissions query
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) => (
+                        parameters.name === 'notifications' ?
+                            Promise.resolve({state: Notification.permission}) :
+                            originalQuery(parameters)
+                    );
+                '''
+            })
+            self._log_to_file("反自动化脚本注入成功")
+        except Exception as e:
+            self._log_to_file(f"反自动化脚本注入失败(非致命): {e}")
+
     def safe_update(self):
         """安全地更新页面，暴力忽略所有退出时的错误"""
         # 1. 极速检查：如果页面已销毁或程序已停止，直接返回
@@ -2296,6 +2717,12 @@ class FletSSHPortForwarder:
         # 这是为了让所有后台线程的 _append_log 和 safe_update 里的
         # `if self.page is None` 检查立刻生效
         self.page = None
+        
+        # 2.1 清除 Signal 的 page 引用，避免悬挂引用
+        for sig in (self.update_status_signal, self.connection_status_signal,
+                    self.autodl_status_signal, self.autodl_login_signal,
+                    self.update_device_table_signal):
+            sig.page = None
         
         self.stop_event.set()
         
@@ -2328,6 +2755,16 @@ class FletSSHPortForwarder:
             finally:
                 self.autodl_driver = None
         
+        # 4.1 清理临时 Chrome profile 目录（缺陷6修复）
+        if getattr(self, '_tmp_chrome_profile', None):
+            try:
+                import shutil
+                shutil.rmtree(self._tmp_chrome_profile, ignore_errors=True)
+                self._log_to_file(f"已清理临时 Chrome profile: {self._tmp_chrome_profile}")
+            except Exception:
+                pass
+            self._tmp_chrome_profile = None
+        
         # 5. 强制杀掉可能的残留进程
         self._force_kill_zombie_chrome()
         self._log_to_file("--- 清理流程结束 ---")
@@ -2350,7 +2787,7 @@ class FletSSHPortForwarder:
         if not self.autodl_driver:
             self.autodl_status_signal.emit('浏览器未初始化')
             return
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
         if self.refreshing:
@@ -2360,7 +2797,7 @@ class FletSSHPortForwarder:
             self.autodl_status_signal.emit('正在刷新中，请稍候...')
             return
         self.refreshing = True
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         def refresh_thread():
             try:
                 self.autodl_status_signal.emit('正在刷新设备列表...')
@@ -2412,8 +2849,9 @@ class FletSSHPortForwarder:
                 except:
                     self.refreshing = False
                 try:
-                    self.autodl_busy = False
-                except:
+                    if self.selenium_lock.locked():
+                        self.selenium_lock.release()
+                except RuntimeError:
                     pass
                 self.autodl_status_signal.emit('刷新任务完成')
         threading.Thread(target=refresh_thread, daemon=True).start()
@@ -2423,7 +2861,7 @@ class FletSSHPortForwarder:
             if not silent:
                 self.autodl_status_signal.emit('请先登录AutoDL')
             return
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             if not silent:
                 self.autodl_status_signal.emit('正在执行任务，请稍候')
             return
@@ -2504,7 +2942,7 @@ class FletSSHPortForwarder:
 
     def _auto_refresh_tick(self):
         # 增加 self.page 检查；续费等后台任务期间跳过自动刷新，避免 driver 竞争
-        if not self.running or not self.page or not self.is_autodl_logged_in or self.refreshing or self.port_forwarding_setup or self.autodl_busy:
+        if not self.running or not self.page or not self.is_autodl_logged_in or self.refreshing or self.port_forwarding_setup or self.selenium_lock.locked():
             return
         if self.silent_refresh_checkbox.value:
             self.autodl_refresh_devices_quick(True)
@@ -2518,7 +2956,7 @@ class FletSSHPortForwarder:
             diff = int(time.time() - self.last_auto_refresh_time)
             if diff >= 0:
                 # 任务进行中时不覆盖任务状态标签
-                if self.autodl_busy:
+                if self.selenium_lock.locked():
                     return
                 self.autodl_status_label.value = f'已自动刷新 ({diff}秒前)'
                 self.safe_update()
@@ -2608,19 +3046,27 @@ class FletSSHPortForwarder:
                     cell_text = (cells[0].text or '').strip()
                     lines = [ln.strip() for ln in cell_text.split('\n') if ln.strip()]
                     device_name = lines[0] if lines else '未知设备'
+                    # AutoDL 实例 ID 格式: 字母数字混合+连字符，如 u7k8nubme3-57b21c90
                     id_line = ''
                     for ln in lines[1:]:
-                        if _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
+                        if _re.fullmatch(r'[a-zA-Z0-9\-]{8,}', ln) and '-' in ln:
                             id_line = ln
                             break
                     device_id = id_line
-                    for ln in lines[1:]:
-                        if '-' in ln and _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
-                            continue
-                        remark = ln
-                        break
-                    if not remark and len(lines) >= 3:
-                        remark = lines[2]
+                    # 备注是 ID 之后的下一行（跳过 GPU 状态行）
+                    remark = ''
+                    _gpu_keywords = ('GPU', 'gpu', '充足', '不足', '无卡')
+                    if id_line:
+                        id_idx = lines.index(id_line)
+                        for ln in lines[id_idx + 1:]:
+                            if not any(k in ln for k in _gpu_keywords):
+                                remark = ln
+                                break
+                    elif len(lines) >= 3:
+                        for ln in lines[2:]:
+                            if not any(k in ln for k in _gpu_keywords):
+                                remark = ln
+                                break
                     remark = (remark or '').replace('查看详情', '').strip()
                     status_text = (cells[1].text or '').strip() if len(cells) > 1 else '未知状态'
                     status_lines = [ln.strip() for ln in status_text.split('\n') if ln.strip()]
@@ -2664,17 +3110,23 @@ class FletSSHPortForwarder:
                         device_name = lines[0] if lines else '未知设备'
                         id_line = ''
                         for ln in lines[1:]:
-                            if _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
+                            if _re.fullmatch(r'[a-zA-Z0-9\-]{8,}', ln) and '-' in ln:
                                 id_line = ln
                                 break
                         device_id = id_line
-                        for ln in lines[1:]:
-                            if '-' in ln and _re.fullmatch(r'[a-fA-F0-9\-]{6,}', ln):
-                                continue
-                            remark = ln
-                            break
-                        if not remark and len(lines) >= 3:
-                            remark = lines[2]
+                        remark = ''
+                        _gpu_keywords = ('GPU', 'gpu', '充足', '不足', '无卡')
+                        if id_line:
+                            id_idx = lines.index(id_line)
+                            for ln in lines[id_idx + 1:]:
+                                if not any(k in ln for k in _gpu_keywords):
+                                    remark = ln
+                                    break
+                        elif len(lines) >= 3:
+                            for ln in lines[2:]:
+                                if not any(k in ln for k in _gpu_keywords):
+                                    remark = ln
+                                    break
                         remark = (remark or '').replace('查看详情', '').strip()
                         status_lines = [ln for ln in lines[1:] if ln]
                         status_main = status_lines[0] if status_lines else '未知状态'
@@ -2721,10 +3173,10 @@ class FletSSHPortForwarder:
                 return '0'
 
     def autodl_start(self, device_id=None, remark=None):
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         def start_thread():
             try:
                 self.autodl_status_signal.emit(f'准备开机: device_id={device_id or "<空>"}, 备注={remark or "<空>"}')
@@ -2762,6 +3214,8 @@ class FletSSHPortForwarder:
                             self.autodl_driver.title 
                             
                             self._goto_instance_list()
+                            # 每次访问页面后同步设备表到UI
+                            self._sync_device_table_from_page()
                             r = None
                             if did:
                                 try:
@@ -2785,6 +3239,7 @@ class FletSSHPortForwarder:
                             sl = st.lower()
                             
                             if ('运行中' in st) or ('running' in sl):
+                                self._sync_device_table_from_page()
                                 return True
                             
                             if any(k in st for k in ['开机中','正在开机','启动中','正在启动','starting','booting']):
@@ -2835,16 +3290,20 @@ class FletSSHPortForwarder:
             except Exception as e:
                 self.autodl_status_signal.emit(f'开机失败: {str(e)}')
             finally:
-                self.autodl_busy = False
+                if self.selenium_lock.locked():
+                    try:
+                        self.selenium_lock.release()
+                    except RuntimeError:
+                        pass
                 if 'ok' in locals() and ok:
                     self.autodl_status_signal.emit('开机任务完成')
         threading.Thread(target=start_thread, daemon=True).start()
 
     def autodl_start_only(self, device_id=None, remark=None):
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         def start_thread():
             try:
                 self.autodl_status_signal.emit(f'准备开机: device_id={device_id or "<空>"}, 备注={remark or "<空>"}')
@@ -2880,6 +3339,8 @@ class FletSSHPortForwarder:
                         try:
                             self.autodl_driver.title
                             self._goto_instance_list()
+                            # 每次访问页面后同步设备表到UI
+                            self._sync_device_table_from_page()
                             r = None
                             if did:
                                 try: r = self._find_row_by_device_id(did)
@@ -2897,6 +3358,7 @@ class FletSSHPortForwarder:
                             st = tds2[1].text if len(tds2) >= 2 else r.text
                             sl = st.lower()
                             if ('运行中' in st) or ('running' in sl):
+                                self._sync_device_table_from_page()
                                 return True
                             
                             if any(k in st for k in ['开机中','正在开机','启动中','正在启动','starting','booting']):
@@ -2925,16 +3387,20 @@ class FletSSHPortForwarder:
             except Exception as e:
                 self.autodl_status_signal.emit(f'开机失败: {str(e)}')
             finally:
-                self.autodl_busy = False
+                if self.selenium_lock.locked():
+                    try:
+                        self.selenium_lock.release()
+                    except RuntimeError:
+                        pass
                 if 'ok' in locals() and ok:
                     self.autodl_status_signal.emit('开机任务完成')
         threading.Thread(target=start_thread, daemon=True).start()
 
     def autodl_start_nogpu(self, device_id=None, remark=None):
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         def start_thread():
             try:
                 self.autodl_status_signal.emit(f'准备无卡开机: device_id={device_id or "<空>"}, 备注={remark or "<空>"}')
@@ -2971,6 +3437,7 @@ class FletSSHPortForwarder:
                     if any(k in st for k in ['开机中','正在开机','启动中','正在启动']) or any(k in sl for k in ['pending','starting','booting']):
                          click_sent = True
                          self.autodl_status_signal.emit(f'检测到设备状态变更: {st}')
+                         self._sync_device_table_from_page()
                 except Exception:
                     pass
 
@@ -2993,15 +3460,19 @@ class FletSSHPortForwarder:
             except Exception as e:
                 self.autodl_status_signal.emit(f'无卡开机失败: {str(e)}')
             finally:
-                self.autodl_busy = False
+                if self.selenium_lock.locked():
+                    try:
+                        self.selenium_lock.release()
+                    except RuntimeError:
+                        pass
                 self.autodl_status_signal.emit('开机任务完成')
         threading.Thread(target=start_thread, daemon=True).start()
 
     def autodl_stop(self, device_id=None, remark=None):
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         def stop_thread():
             try:
                 # 1. 确保 Driver 存活
@@ -3066,6 +3537,8 @@ class FletSSHPortForwarder:
                         try:
                             self.autodl_driver.title
                             self._goto_instance_list()
+                            # 每次访问页面后同步设备表到UI
+                            self._sync_device_table_from_page()
                             r = None
                             if did:
                                 try: r = self._find_row_by_device_id(did)
@@ -3083,6 +3556,7 @@ class FletSSHPortForwarder:
                             st = tds2[1].text if len(tds2) >= 2 else r.text
                             stl = st.lower()
                             if ('已关机' in st) or ('stopped' in stl):
+                                self._sync_device_table_from_page()
                                 return True
                             
                             if any(k in st for k in ['关机中','正在关机','停止中','关闭中']) or any(k in stl for k in ['shutting','stopping']):
@@ -3111,7 +3585,11 @@ class FletSSHPortForwarder:
             except Exception as e:
                 self.autodl_status_signal.emit(f'关机失败: {str(e)}')
             finally:
-                self.autodl_busy = False
+                if self.selenium_lock.locked():
+                    try:
+                        self.selenium_lock.release()
+                    except RuntimeError:
+                        pass
                 if 'ok' in locals() and ok:
                     self.autodl_status_signal.emit('关机任务完成')
         threading.Thread(target=stop_thread, daemon=True).start()
@@ -3124,6 +3602,14 @@ class FletSSHPortForwarder:
             if rows:
                 table_data = self._format_rows_for_table(rows)
                 self.update_device_table_signal.emit(table_data)
+                # Signal.emit 通过 run_thread_safe 调度到主线程，
+                # 再追加一次显式 page.update 确保渲染
+                time.sleep(0.15)
+                try:
+                    if self.page:
+                        self.page.run_thread_safe(lambda: self.safe_update())
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -3175,13 +3661,13 @@ class FletSSHPortForwarder:
     # ── 一键关机 ──
     def _on_shutdown_all_click(self, e=None):
         """关闭所有运行中的设备，多标签页并行"""
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
         if not self.autodl_driver:
             self.autodl_status_signal.emit('浏览器未启动，请先登录')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         self._renew_cancel = False
         self.autodl_shutdown_all_button.disabled = True
         self.autodl_renew_button.disabled = True
@@ -3533,7 +4019,11 @@ class FletSSHPortForwarder:
 
     def _finish_shutdown_all(self):
         """一键关机结束清理"""
-        self.autodl_busy = False
+        if self.selenium_lock.locked():
+            try:
+                self.selenium_lock.release()
+            except RuntimeError:
+                pass
         self._renew_cancel = False
         self.autodl_shutdown_all_button.disabled = False
         self.autodl_renew_button.disabled = False
@@ -3547,13 +4037,13 @@ class FletSSHPortForwarder:
     # ── 一键续费 ──
     def _on_renew_click(self, e=None):
         """点击续费按钮 → 分析设备 → 直接执行（无确认框）"""
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
         if not self.autodl_driver:
             self.autodl_status_signal.emit('浏览器未启动，请先登录')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         self._renew_cancel = False
         self.autodl_renew_button.disabled = True
         self.autodl_shutdown_all_button.disabled = True
@@ -3625,7 +4115,11 @@ class FletSSHPortForwarder:
             except Exception as e:
                 self._log_to_file(f'续费异常: {str(e)}')
                 self.autodl_status_signal.emit(f'续费失败: {str(e)}')
-                self.autodl_busy = False
+                if self.selenium_lock.locked():
+                    try:
+                        self.selenium_lock.release()
+                    except RuntimeError:
+                        pass
                 self.autodl_renew_button.disabled = False
                 self._hide_task_bar()
                 self.safe_update()
@@ -4006,7 +4500,11 @@ class FletSSHPortForwarder:
 
     def _finish_renew(self):
         """续费结束清理"""
-        self.autodl_busy = False
+        if self.selenium_lock.locked():
+            try:
+                self.selenium_lock.release()
+            except RuntimeError:
+                pass
         self._renew_cancel = False
         self.autodl_renew_button.disabled = False
         self.autodl_shutdown_all_button.disabled = False
@@ -4050,10 +4548,10 @@ class FletSSHPortForwarder:
         return None
 
     def autodl_forward_only(self, device_id=None, remark=None):
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         def forward_thread():
             try:
                 if self.is_connected:
@@ -4078,15 +4576,19 @@ class FletSSHPortForwarder:
             except Exception as e:
                 self.autodl_status_signal.emit(f'连接失败: {str(e)}')
             finally:
-                self.autodl_busy = False
+                if self.selenium_lock.locked():
+                    try:
+                        self.selenium_lock.release()
+                    except RuntimeError:
+                        pass
                 self.autodl_status_signal.emit('连接任务完成')
         threading.Thread(target=forward_thread, daemon=True).start()
 
     def autodl_connect_device(self, device_id=None, remark=None):
-        if self.autodl_busy:
+        if self.selenium_lock.locked():
             self.autodl_status_signal.emit('正在执行任务，请稍候...')
             return
-        self.autodl_busy = True
+        self.selenium_lock.acquire()
         def connect_thread():
             try:
                 if self.is_connected:
@@ -4116,7 +4618,11 @@ class FletSSHPortForwarder:
             except Exception as e:
                 self.autodl_status_signal.emit(f'连接失败: {str(e)}')
             finally:
-                self.autodl_busy = False
+                if self.selenium_lock.locked():
+                    try:
+                        self.selenium_lock.release()
+                    except RuntimeError:
+                        pass
                 self.autodl_status_signal.emit('连接任务完成')
         threading.Thread(target=connect_thread, daemon=True).start()
 
@@ -4160,7 +4666,7 @@ class FletSSHPortForwarder:
                 self.autodl_status_signal.emit(f'正在打开浏览器: {url}')
                 if self.auto_open_browser_checkbox.value:
                     try:
-                        success = webbrowser.open(url)
+                        success = _open_url_and_focus(url)
                         if success:
                             self.autodl_status_signal.emit(f'浏览器已成功打开: {url}')
                         else:
@@ -4213,7 +4719,7 @@ class FletSSHPortForwarder:
                 self.autodl_status_signal.emit(f'正在打开浏览器: {url}')
                 if self.auto_open_browser_checkbox.value:
                     try:
-                        success = webbrowser.open(url)
+                        success = _open_url_and_focus(url)
                         if success:
                             self.autodl_status_signal.emit(f'浏览器已成功打开: {url}')
                         else:
@@ -5092,9 +5598,7 @@ class FletSSHPortForwarder:
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.dialog = dlg
-        dlg.open = True
-        self.safe_update()
+        self._open_dialog(dlg)
 
     def _save_device_config(self, dlg, device_id, remark, display_name, ssh_info, remote_port, password, auto_open):
         if not ssh_info or not remote_port or not password:
@@ -5306,6 +5810,8 @@ class FletSSHPortForwarder:
         while time.time() - start_t < timeout:
             try:
                 self._goto_instance_list()
+                # 每次访问页面后同步设备表到UI
+                self._sync_device_table_from_page()
                 r = None
                 if device_id:
                     try:
@@ -5372,6 +5878,8 @@ class FletSSHPortForwarder:
                 self.autodl_driver.title
                 
                 self._goto_instance_list()
+                # 每次访问页面后同步设备表到UI
+                self._sync_device_table_from_page()
                 r = None
                 if device_id:
                     try:
@@ -5384,6 +5892,7 @@ class FletSSHPortForwarder:
                     except Exception:
                         r = None
                 if r and self._is_running_row(r) and self._has_nogpu_mode(r):
+                    self._sync_device_table_from_page()
                     return r
                 try:
                     if r:
@@ -5446,9 +5955,7 @@ class FletSSHPortForwarder:
 
     def open_readme(self, e=None):
         try:
-            p = self.readme_path
-            if not p or not os.path.exists(p):
-                p = self._ensure_readme_file()
+            p = self._ensure_readme_file()
             if p and os.path.exists(p):
                 os.startfile(p)
             else:
@@ -5458,6 +5965,7 @@ class FletSSHPortForwarder:
 
     def on_config_combo_change(self, e):
         self.load_selected_config(e)
+        self.update_delete_button_state()
 
     def _persist_login_prefs(self, e=None):
         try:
